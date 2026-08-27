@@ -89,9 +89,19 @@ async function startAcpAgent(host: string, port: number): Promise<void> {
 
   const agentInstance = new AcpAgent(host, port);
 
-  // Bun.stdout.stream()/Bun.stdin.stream() are typed as BunFile streams at
-  // compile time but return web streams at runtime; the SDK expects web streams.
-  const output = Bun.stdout.stream() as unknown as WritableStream<Uint8Array>;
+  // Bun.stdout.stream() does not provide the web WritableStream API
+  // (getWriter) the SDK's ndJsonStream relies on, so wrap process.stdout in a
+  // standard WritableStream.  stdin is consumed via Bun.stdin.stream(), which
+  // implements the web ReadableStream API (getReader).
+  const output = new WritableStream<Uint8Array>({
+    write(chunk) {
+      return new Promise<void>((resolve, reject) => {
+        process.stdout.write(chunk, (error?: Error | null) =>
+          error ? reject(error) : resolve(),
+        );
+      });
+    },
+  });
   const input = Bun.stdin.stream() as unknown as ReadableStream<Uint8Array>;
 
   const stream = acp.ndJsonStream(output, input);

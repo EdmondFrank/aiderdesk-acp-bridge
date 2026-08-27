@@ -20,7 +20,9 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
 
 ## Requirements
 
-- [Bun](https://bun.sh) >= 1.1
+- [Bun](https://bun.sh) >= 1.3 — Bun 1.2.x buffers piped stdin until EOF and
+  lacks the web `WritableStream` API on stdout, which breaks ACP over stdio.
+  Verify with `bun --version`.
 - A running AiderDesk server (`aiderdesk` or `aiderdesk start`)
 
 ## Usage
