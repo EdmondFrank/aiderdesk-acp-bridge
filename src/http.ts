@@ -22,6 +22,8 @@ function parseBody(raw: string): unknown {
 /**
  * Perform a JSON request against the AiderDesk REST API.
  * Returns the HTTP status and the parsed body (raw text when not JSON).
+ * `timeoutMs` defaults to the standard JSON timeout; pass a larger value for
+ * endpoints that may wait on the model (e.g. compact conversation).
  */
 export async function fetchJSON(
   host: string,
@@ -29,6 +31,7 @@ export async function fetchJSON(
   path: string,
   method: 'GET' | 'POST',
   body?: string,
+  timeoutMs: number = JSON_TIMEOUT_MS,
 ): Promise<JsonResponse> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
@@ -39,7 +42,7 @@ export async function fetchJSON(
     method,
     headers,
     body,
-    signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   const raw = await response.text();
@@ -52,16 +55,19 @@ export type SSEStreamResult = {
 };
 
 /**
- * Open a streaming POST to /api/run-prompt (Server-Sent Events).
+ * Open a streaming POST against an SSE endpoint on the AiderDesk server.
  * Resolves once response headers arrive and the task id is known.
+ * Supported endpoints: `/api/run-prompt` and (for extension commands)
+ * `/api/project/custom-commands` when the server streams events back.
  */
 export async function requestSSEStream(
   host: string,
   port: number,
+  path: string,
   body: string,
   signal?: AbortSignal,
 ): Promise<SSEStreamResult> {
-  const response = await fetch(`${baseUrl(host, port)}/api/run-prompt`, {
+  const response = await fetch(`${baseUrl(host, port)}${path}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -86,4 +92,108 @@ export async function requestSSEStream(
 /** Ask the AiderDesk server to interrupt a running task (best-effort). */
 export async function callInterrupt(host: string, port: number, projectDir: string, taskId: string): Promise<void> {
   await fetchJSON(host, port, '/api/project/interrupt', 'POST', JSON.stringify({ projectDir, taskId }));
+}
+
+/**
+ * Create a task for a project via `POST /api/project/tasks/new` and return
+ * its id. Used to give extension commands (which have no expandable template)
+ * a task to run against.
+ */
+export async function createTask(
+  host: string,
+  port: number,
+  projectDir: string,
+  name?: string,
+): Promise<string> {
+  const response = await fetchJSON(
+    host,
+    port,
+    '/api/project/tasks/new',
+    'POST',
+    JSON.stringify({ projectDir, ...(name ? { name } : {}) }),
+  );
+  if (response.status !== 200) {
+    throw new Error(`Failed to create task: server returned ${response.status}`);
+  }
+  const data = response.data as { id?: string };
+  if (!data?.id) {
+    throw new Error(`Failed to create task: response missing id (${response.status})`);
+  }
+  return data.id;
+}
+
+/** Ask the AiderDesk server to run an extension command (best-effort). */
+export async function runCustomCommand(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  commandName: string,
+  args: string[],
+  mode: string,
+): Promise<void> {
+  await fetchJSON(
+    host,
+    port,
+    '/api/project/custom-commands',
+    'POST',
+    JSON.stringify({ projectDir, taskId, commandName, args, mode }),
+  );
+}
+
+/**
+ * Compact the conversation (`/compact`). The server waits for the model to
+ * produce the compacted summary, so a long timeout is used.
+ */
+export async function compactConversation(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  mode: string,
+  customInstructions?: string,
+): Promise<void> {
+  await fetchJSON(
+    host,
+    port,
+    '/api/project/compact-conversation',
+    'POST',
+    JSON.stringify({ projectDir, taskId, mode, ...(customInstructions ? { customInstructions } : {}) }),
+    SSE_CONNECT_TIMEOUT_MS,
+  );
+}
+
+/** Compact the conversation with an AI-generated summary (`/smart-compact`). */
+export async function smartCompactConversation(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+): Promise<void> {
+  await fetchJSON(
+    host,
+    port,
+    '/api/project/smart-compact-conversation',
+    'POST',
+    JSON.stringify({ projectDir, taskId }),
+    SSE_CONNECT_TIMEOUT_MS,
+  );
+}
+
+/** Hand off the conversation to another agent (`/handoff`, `/hand-off`). */
+export async function handoffConversation(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  focus?: string,
+): Promise<void> {
+  await fetchJSON(
+    host,
+    port,
+    '/api/project/handoff-conversation',
+    'POST',
+    JSON.stringify({ projectDir, taskId, ...(focus ? { focus } : {}) }),
+    SSE_CONNECT_TIMEOUT_MS,
+  );
 }

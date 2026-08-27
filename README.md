@@ -13,9 +13,14 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
 - Full ACP agent lifecycle: `initialize`, `authenticate`, `session/new`,
   `session/set_config_option`, `session/prompt`, `session/cancel`
 - Mode / agent-profile / autonomy configuration surfaced as ACP session config options
+- Slash commands: custom commands (`~/.aider-desk/commands/` and
+  `<project>/.aider-desk/commands/`) are advertised to ACP clients and executed
+  with argument substitution and `!shell` support; built-in session-control
+  commands (`/new`, `/compact`, `/smart-compact`, `/handoff`) are translated
+  into the corresponding AiderDesk REST calls
 - SSE event translation: response chunks, reasoning, tool calls, usage updates,
   session info, cancellation — including `agent_thought_chunk`, `agent_message_chunk`,
-  `tool_call`, `tool_call_update`, `usage_update` notifications
+  `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications
 - Single-file compiled binary via `bun build --compile`
 
 ## Requirements
@@ -71,9 +76,52 @@ The port can also be set via the `AIDER_DESK_PORT` environment variable.
 
 | ACP method                      | AiderDesk REST call(s)                                             |
 | ------------------------------- | ------------------------------------------------------------------ |
-| `session/new`                   | `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings` |
+| `session/new`                   | `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` |
 | `session/prompt`                | `POST /api/run-prompt` (SSE)                                       |
 | `session/cancel`                | aborts the SSE request + `POST /api/project/interrupt`             |
+
+## Slash commands
+
+The bridge discovers the project's custom and extension commands from
+`GET /api/project/commands` when a session is created and advertises them to ACP
+clients via an `available_commands_update` notification, so clients can offer
+them, e.g. as `/command` completions.
+
+Commands are invoked by sending `/name arg1 arg2` as the prompt:
+
+- **Built-in session-control commands** are handled by the bridge itself and
+  translated to AiderDesk REST calls (they never produce a model turn):
+
+  | Command          | AiderDesk REST call                     | Notes                                              |
+  | ---------------- | --------------------------------------- | -------------------------------------------------- |
+  | `/new [name]`    | `POST /api/project/tasks/new`           | starts a new task and makes it the session's task  |
+  | `/compact [hint]`| `POST /api/project/compact-conversation`| requires an existing task                           |
+  | `/smart-compact` | `POST /api/project/smart-compact-conversation` | requires an existing task                  |
+  | `/handoff [focus]` / `/hand-off [focus]` | `POST /api/project/handoff-conversation` | requires an existing task            |
+
+- **Custom commands** (markdown files under `~/.aider-desk/commands/` or
+  `<project>/.aider-desk/commands/`) are expanded by the bridge itself —
+  `{{1}}`, `{{2}}`, `{{ARGUMENTS}}` placeholders, optional arguments, and
+  `!shell` lines — and then streamed through the regular `POST /api/run-prompt`
+  SSE flow. The command's `autonomyMode` override (when declared) and the
+  current mode/profile/autonomy settings are applied. So no server changes are
+  required.
+- **Extension commands** (from AiderDesk extensions) have no expandable
+  template; the bridge creates a task if needed (`POST /api/project/tasks/new`)
+  and asks the server to run the command (`POST /api/project/custom-commands`),
+  best-effort and without streaming.
+- Unknown `/foo` text is passed through unchanged as a regular prompt.
+
+### Known limitations
+
+- Custom command `includeContext: false` and `skills` frontmatter are not
+  surfaced over the REST API and are therefore ignored; the command runs with
+  the task's normal conversation context.
+- Extension commands never stream results back to the client (the AiderDesk
+  REST API offers no event stream for `custom-commands`); custom commands
+  stream fully.
+- Command definitions are fetched once per session; file changes while a
+  session is open require a new session to take effect.
 
 ## Development
 

@@ -110,7 +110,7 @@ async function startAcpAgent(host: string, port: number): Promise<void> {
     .agent({ name: 'aiderdesk' })
     .onRequest('initialize', (ctx) => agentInstance.initialize(ctx.params))
     .onRequest('authenticate', (ctx) => agentInstance.authenticate(ctx.params))
-    .onRequest('session/new', (ctx) => agentInstance.newSession(ctx.params))
+    .onRequest('session/new', (ctx) => agentInstance.newSession(ctx.params, ctx.client))
     .onRequest('session/set_config_option', (ctx) => agentInstance.setConfigOption(ctx.params))
     .onRequest('session/prompt', (ctx) => agentInstance.prompt(ctx.params, ctx.client))
     .onNotification('session/cancel', (ctx) => agentInstance.cancel(ctx.params))

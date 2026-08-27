@@ -102,10 +102,14 @@ describe('AcpAgent', () => {
     router.add('GET', '/api/project/custom-modes', () =>
       new Response(JSON.stringify([{ name: 'review', label: 'Review', description: 'Review changes' }]), { status: 200 }),
     );
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
-    const response = await agent.newSession({ cwd: '/proj', mcpServers: [] });
+    const { cx } = mockContext();
+    const response = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
 
     expect(response.sessionId.startsWith('acp-')).toBe(true);
     const optionIds = response.configOptions!.map((o) => o.id);
@@ -116,6 +120,40 @@ describe('AcpAgent', () => {
     const profileOption = selectById(response.configOptions, 'agent_profile');
     expect(profileOption.currentValue).toBe('senior'); // project default wins
     expect(response.modes!.currentModeId).toBe('agent');
+  });
+
+  test('newSession advertises available commands and built-ins', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [{ name: 'test', description: 'Run tests', arguments: [{ description: 'suite' }] }],
+          extensionCommands: [{ name: 'summarize', description: 'Summarize the conversation', arguments: [] }],
+        }),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls, firstNotify } = mockContext();
+    await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    await firstNotify;
+
+    const update = notifyCalls.find((c) => c.method === acp.methods.client.session.update);
+    const updateParams = update?.params as { update: { sessionUpdate: string; availableCommands: Array<{ name: string; description: string; input?: { hint: string } }> } };
+    expect(updateParams.update.sessionUpdate).toBe('available_commands_update');
+    expect(updateParams.update.availableCommands).toEqual([
+      { name: 'compact', description: 'Compact the conversation', input: { hint: '1: custom compact instructions (optional)' } },
+      { name: 'handoff', description: 'Hand off the conversation with a focus note', input: { hint: '1: focus note (optional)' } },
+      { name: 'new', description: 'Start a new task', input: { hint: '1: task name (optional)' } },
+      { name: 'smart-compact', description: 'Compact the conversation with an AI-generated summary' },
+      { name: 'summarize', description: 'Summarize the conversation' },
+      { name: 'test', description: 'Run tests', input: { hint: '1: suite' } },
+    ]);
   });
 
   test('prompt translates SSE events into ACP session updates', async () => {
@@ -138,8 +176,8 @@ describe('AcpAgent', () => {
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
-    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] });
     const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
 
     const result = await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
 
@@ -185,11 +223,14 @@ describe('AcpAgent', () => {
     router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
     router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
     router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
-    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] });
     const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
 
     const result = await agent.prompt({ sessionId: session.sessionId, prompt: [] }, cx);
     expect(result).toEqual({ stopReason: 'end_turn' });
@@ -230,8 +271,8 @@ describe('AcpAgent', () => {
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
-    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] });
     const { cx, firstNotify } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
 
     const promptPromise = agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
 
@@ -251,10 +292,14 @@ describe('AcpAgent', () => {
     router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
     router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
     router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
-    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] });
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
 
     const config = await agent.setConfigOption({
       sessionId: session.sessionId,
@@ -266,5 +311,485 @@ describe('AcpAgent', () => {
     await expect(
       agent.setConfigOption({ sessionId: 'missing', configId: 'autonomy_mode', value: 'manual' }),
     ).rejects.toThrow('Session not found');
+  });
+
+  test('prompt expands a custom command and streams it through run-prompt', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [
+            {
+              name: 'test',
+              description: 'Run tests',
+              arguments: [{ description: 'suite' }],
+              template: 'Run the {{1}} suite',
+            },
+          ],
+          extensionCommands: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    let seenBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      seenBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(
+        sseBody([
+          { type: 'response-chunk', data: { messageId: 'm1', chunk: 'Running tests now...' } },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200, headers: { 'x-task-id': 'task-1' } },
+      );
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/test unit' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(seenBody).toEqual(
+      expect.objectContaining({ prompt: 'Run the unit suite', projectDir: '/proj', mode: 'agent', autonomyMode: 'guided' }),
+    );
+
+    const chunk = notifyCalls.find((c) => {
+      const p = c.params as { update: { sessionUpdate: string; content?: { text: string } } };
+      return p.update.sessionUpdate === 'agent_message_chunk';
+    })!;
+    expect(((chunk.params as { update: { content: { text: string } } }).update.content.text)).toBe('Running tests now...');
+  });
+
+  test('first-message custom command creates the task and later prompts reuse it', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [
+            { name: 'plan', description: 'Plan', arguments: [], template: 'Create a plan for {{1}}' },
+          ],
+          extensionCommands: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    const bodies: Array<{ taskId?: string }> = [];
+    router.add('POST', '/api/run-prompt', (call) => {
+      const body = JSON.parse(String(call.init?.body)) as { taskId?: string };
+      bodies.push(body);
+      const taskId = body.taskId ?? 'task-first';
+      return new Response(
+        sseBody([
+          { type: 'response-chunk', data: { messageId: 'm1', chunk: body.taskId ? 'second' : 'first' } },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200, headers: { 'x-task-id': taskId } },
+      );
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/plan alpha' }] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/plan beta' }] }, cx);
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].taskId).toBeUndefined(); // task created server-side on first run
+    expect(bodies[1].taskId).toBe('task-first'); // reused for subsequent commands
+    const chunks = notifyCalls
+      .filter((c) => {
+        const p = c.params as { update: { sessionUpdate: string; content?: { text: string } } };
+        return p.update.sessionUpdate === 'agent_message_chunk';
+      })
+      .map((c) => ((c.params as { update: { content: { text: string } } }).update.content.text));
+    expect(chunks).toContain('first');
+    expect(chunks).toContain('second');
+  });
+
+  test('extension command falls back to the server with a created task', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [],
+          extensionCommands: [{ name: 'summarize', description: 'Summarize the conversation', arguments: [] }],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/tasks/new', () =>
+      new Response(JSON.stringify({ id: 'task-1' }), { status: 200 }),
+    );
+    let customCommandBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/custom-commands', (call) => {
+      customCommandBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response('{}', { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/summarize' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(customCommandBody).toEqual({
+      projectDir: '/proj',
+      taskId: 'task-1',
+      commandName: 'summarize',
+      args: [],
+      mode: 'agent',
+    });
+    expect(router.callsMatching(/\/api\/project\/tasks\/new/)).toHaveLength(1);
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+  });
+
+  test('unknown slash text passes through as a regular prompt', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let seenPrompt = '';
+    router.add('POST', '/api/run-prompt', (call) => {
+      seenPrompt = (JSON.parse(String(call.init?.body)) as { prompt: string }).prompt;
+      return new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/not-a-command hi' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(seenPrompt).toBe('/not-a-command hi');
+  });
+
+  test('custom command with missing required arguments reports an error without calling the server', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [
+            {
+              name: 'review',
+              description: 'Request a review',
+              arguments: [{ description: 'what to review' }],
+              template: 'Review {{1}} please',
+            },
+          ],
+          extensionCommands: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/review' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+    const thought = notifyCalls.find((c) => {
+      const p = c.params as { update: { sessionUpdate: string; content?: { text: string } } };
+      return p.update.sessionUpdate === 'agent_thought_chunk';
+    })!;
+    expect(((thought.params as { update: { content: { text: string } } }).update.content.text)).toContain(
+      "Not enough arguments for command 'review'",
+    );
+  });
+
+  test('/new creates a task and makes it the session task', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    const newTaskBodies: Array<Record<string, unknown>> = [];
+    router.add('POST', '/api/project/tasks/new', (call) => {
+      newTaskBodies.push(JSON.parse(String(call.init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ id: 'task-new' }), { status: 200 });
+    });
+    let seenRunPrompt: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      seenRunPrompt = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/new Fix login flow' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(newTaskBodies).toEqual([{ projectDir: '/proj', name: 'Fix login flow' }]);
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+
+    // The new task is reused by the next regular prompt.
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+    expect(seenRunPrompt?.taskId).toBe('task-new');
+  });
+
+  test('/new without a name still creates a task', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    const newTaskBodies: Array<Record<string, unknown>> = [];
+    router.add('POST', '/api/project/tasks/new', (call) => {
+      newTaskBodies.push(JSON.parse(String(call.init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ id: 'task-new' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/new' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(newTaskBodies).toEqual([{ projectDir: '/proj' }]);
+  });
+
+  test('/compact posts to compact-conversation with mode and custom instructions', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let seenBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/compact-conversation', (call) => {
+      seenBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Conversation compacted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    // Establish a task id like a first prompt would.
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200, headers: { 'x-task-id': 'task-1' } }),
+    );
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/compact focus on APIs' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(seenBody).toEqual({
+      projectDir: '/proj',
+      taskId: 'task-1',
+      mode: 'agent',
+      customInstructions: 'focus on APIs',
+    });
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(1); // only the "hello" prompt
+  });
+
+  test('/compact without a task reports it without calling the server', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/compact' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(router.callsMatching(/\/api\/project\/compact-conversation/)).toHaveLength(0);
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+    const thought = notifyCalls.find((c) => {
+      const p = c.params as { update: { sessionUpdate: string; content?: { text: string } } };
+      return p.update.sessionUpdate === 'agent_thought_chunk';
+    })!;
+    expect(((thought.params as { update: { content: { text: string } } }).update.content.text)).toContain(
+      'No conversation to compact yet',
+    );
+  });
+
+  test('/smart-compact posts to smart-compact-conversation', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let seenBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/smart-compact-conversation', (call) => {
+      seenBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Conversation smart-compacted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200, headers: { 'x-task-id': 'task-1' } }),
+    );
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/smart-compact' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(seenBody).toEqual({ projectDir: '/proj', taskId: 'task-1' });
+  });
+
+  test('/handoff and /hand-off post to handoff-conversation with focus', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    const bodies: Array<Record<string, unknown>> = [];
+    router.add('POST', '/api/project/handoff-conversation', (call) => {
+      bodies.push(JSON.parse(String(call.init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ message: 'Conversation handed off' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200, headers: { 'x-task-id': 'task-1' } }),
+    );
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+
+    await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/hand-off continue the refactor' }] },
+      cx,
+    );
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/handoff' }] }, cx);
+
+    expect(bodies).toEqual([
+      { projectDir: '/proj', taskId: 'task-1', focus: 'continue the refactor' },
+      { projectDir: '/proj', taskId: 'task-1' },
+    ]);
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(1);
+  });
+
+  test('/handoff without a task reports it without calling the server', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/handoff' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(router.callsMatching(/\/api\/project\/handoff-conversation/)).toHaveLength(0);
+  });
+
+  test('built-in command failure reports the error without crashing the session', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/project/tasks/new', () => new Response('boom', { status: 500 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/new' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    const thought = notifyCalls.find((c) => {
+      const p = c.params as { update: { sessionUpdate: string; content?: { text: string } } };
+      return p.update.sessionUpdate === 'agent_thought_chunk';
+    })!;
+    expect(((thought.params as { update: { content: { text: string } } }).update.content.text)).toContain(
+      "Failed to run command '/new'",
+    );
   });
 });
