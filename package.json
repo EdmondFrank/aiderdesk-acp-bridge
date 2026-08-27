@@ -1,0 +1,30 @@
+{
+  "name": "aiderdesk-acp-bridge",
+  "version": "0.1.0",
+  "description": "Standalone ACP (Agent Client Protocol) bridge for AiderDesk, powered by Bun",
+  "type": "module",
+  "module": "src/index.ts",
+  "bin": {
+    "aiderdesk-acp-bridge": "src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build src/index.ts --compile --outfile dist/aiderdesk-acp-bridge"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "5.7.3"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
