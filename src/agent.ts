@@ -18,11 +18,13 @@ import {
   callInterrupt,
   compactConversation,
   createTask,
+  fetchTask,
   handoffConversation,
   requestSSEStream,
   runCustomCommand,
   smartCompactConversation,
 } from './http';
+import type { TaskReadMessage } from './http';
 import {
   buildConfigOptions,
   buildModeState,
@@ -450,7 +452,7 @@ export class AcpAgent {
             session.mode,
             customInstructions,
           );
-          await notifyThought(cx, sessionId, 'Conversation compacted.');
+          await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation compacted.');
           return { stopReason: 'end_turn' };
         }
         case 'smart-compact': {
@@ -459,7 +461,7 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           await smartCompactConversation(this.host, this.port, session.cwd, session.taskId);
-          await notifyThought(cx, sessionId, 'Conversation smart-compacted.');
+          await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation smart-compacted.');
           return { stopReason: 'end_turn' };
         }
         case 'handoff': {
@@ -468,8 +470,17 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           const focus = args.join(' ').trim() || undefined;
-          await handoffConversation(this.host, this.port, session.cwd, session.taskId, focus);
-          await notifyThought(cx, sessionId, 'Conversation handed off.');
+          const newTaskId = await handoffConversation(this.host, this.port, session.cwd, session.taskId, focus);
+          if (newTaskId) {
+            session.taskId = newTaskId;
+            await notifyThought(cx, sessionId, 'Conversation handed off.');
+          } else {
+            await notifyThought(
+              cx,
+              sessionId,
+              'Handoff did not create a new task; continuing the current conversation.',
+            );
+          }
           return { stopReason: 'end_turn' };
         }
         default:
@@ -481,6 +492,27 @@ export class AcpAgent {
       await notifyThought(cx, sessionId, `Failed to run command '/${command.name}': ${message}`);
       return { stopReason: 'end_turn' };
     }
+  }
+
+  /**
+   * After a compaction, relay the server's new compacted context summary to
+   * the client so the session reflects what replaced the conversation.
+   * Best-effort: falls back to the plain confirmation note when the summary
+   * can't be fetched.
+   */
+  private async notifyCompactionResult(
+    cx: acp.AgentContext,
+    sessionId: string,
+    projectDir: string,
+    taskId: string,
+    fallbackText: string,
+  ): Promise<void> {
+    const summary = extractCompactionSummary(await fetchTask(this.host, this.port, projectDir, taskId));
+    if (summary) {
+      await notifyThought(cx, sessionId, `${fallbackText} The conversation was replaced by this summary:\n\n${summary}`);
+      return;
+    }
+    await notifyThought(cx, sessionId, fallbackText);
   }
 
   async cancel(params: acp.CancelNotification): Promise<void> {
@@ -738,6 +770,25 @@ async function notifyThought(cx: acp.AgentContext, sessionId: string, text: stri
       content: { type: 'text', text },
     },
   });
+}
+
+/**
+ * Extract the compacted summary from a task's context messages: the last
+ * assistant response. The server replaces the context with
+ * `[user message, ...skill activations, summary]` after a compaction, so the
+ * trailing `response-completed` message holds the summary text.
+ */
+function extractCompactionSummary(messages: TaskReadMessage[] | undefined): string | undefined {
+  if (!messages) {
+    return undefined;
+  }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.type === 'response-completed' && message.content?.trim()) {
+      return message.content.trim();
+    }
+  }
+  return undefined;
 }
 
 export { getVersion };

@@ -98,7 +98,7 @@ Commands are invoked by sending `/name arg1 arg2` as the prompt:
   | `/new [name]`    | `POST /api/project/tasks/new`           | starts a new task and makes it the session's task  |
   | `/compact [hint]`| `POST /api/project/compact-conversation`| requires an existing task                           |
   | `/smart-compact` | `POST /api/project/smart-compact-conversation` | requires an existing task                  |
-  | `/handoff [focus]` / `/hand-off [focus]` | `POST /api/project/handoff-conversation` | requires an existing task            |
+  | `/handoff [focus]` / `/hand-off [focus]` | `POST /api/project/handoff-conversation` | requires an existing task; creates a new task and makes it the session's task |
 
 - **Custom commands** (markdown files under `~/.aider-desk/commands/` or
   `<project>/.aider-desk/commands/`) are expanded by the bridge itself —

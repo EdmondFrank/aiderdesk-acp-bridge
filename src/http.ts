@@ -49,6 +49,41 @@ export async function fetchJSON(
   return { status: response.status, data: parseBody(raw) };
 }
 
+/** Minimal shape of a task context message returned by the readonly API. */
+export type TaskReadMessage = {
+  type?: string;
+  messageId?: string;
+  content?: string;
+};
+
+/**
+ * Fetch a task's current context messages via `GET /api/readonly/tasks/:taskId`.
+ * Returns `undefined` on any failure so callers degrade gracefully (used to
+ * surface the compacted summary after `/compact`).
+ */
+export async function fetchTask(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+): Promise<TaskReadMessage[] | undefined> {
+  try {
+    const response = await fetchJSON(
+      host,
+      port,
+      `/api/readonly/tasks/${encodeURIComponent(taskId)}?projectDir=${encodeURIComponent(projectDir)}`,
+      'GET',
+    );
+    if (response.status !== 200) {
+      return undefined;
+    }
+    const messages = (response.data as { messages?: unknown } | undefined)?.messages;
+    return Array.isArray(messages) ? (messages as TaskReadMessage[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export type SSEStreamResult = {
   stream: ReadableStream<Uint8Array>;
   taskId: string;
@@ -180,15 +215,15 @@ export async function smartCompactConversation(
   );
 }
 
-/** Hand off the conversation to another agent (`/handoff`, `/hand-off`). */
+/** Hand off the conversation to another agent (`/handoff`, `/hand-off`). Returns the new task id. */
 export async function handoffConversation(
   host: string,
   port: number,
   projectDir: string,
   taskId: string,
   focus?: string,
-): Promise<void> {
-  await fetchJSON(
+): Promise<string | undefined> {
+  const response = await fetchJSON(
     host,
     port,
     '/api/project/handoff-conversation',
@@ -196,4 +231,6 @@ export async function handoffConversation(
     JSON.stringify({ projectDir, taskId, ...(focus ? { focus } : {}) }),
     SSE_CONNECT_TIMEOUT_MS,
   );
+  const data = response.data as { taskId?: unknown } | undefined;
+  return typeof data?.taskId === 'string' ? data.taskId : undefined;
 }

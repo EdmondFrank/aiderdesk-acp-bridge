@@ -5,6 +5,7 @@ import {
   compactConversation,
   createTask,
   fetchJSON,
+  fetchTask,
   handoffConversation,
   requestSSEStream,
   runCustomCommand,
@@ -167,29 +168,60 @@ describe('smartCompactConversation', () => {
   });
 });
 
+describe('fetchTask', () => {
+  test('GETs the readonly task endpoint with projectDir and returns the messages', async () => {
+    let seenUrl = '';
+    installFetchMock(async (url) => {
+      seenUrl = url;
+      return new Response(
+        JSON.stringify({ messages: [{ type: 'response-completed', messageId: 'm2', content: 'summary' }] }),
+        { status: 200 },
+      );
+    });
+    const messages = await fetchTask('localhost', 24337, '/proj', 'task-1');
+    expect(seenUrl).toContain('/api/readonly/tasks/task-1');
+    expect(seenUrl).toContain(`projectDir=${encodeURIComponent('/proj')}`);
+    expect(messages).toEqual([{ type: 'response-completed', messageId: 'm2', content: 'summary' }]);
+  });
+
+  test('returns undefined on a non-200 response', async () => {
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    expect(await fetchTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+  });
+
+  test('returns undefined on a fetch failure', async () => {
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    expect(await fetchTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+  });
+});
+
 describe('handoffConversation', () => {
-  test('POSTs projectDir, taskId and optional focus', async () => {
+  test('POSTs projectDir, taskId and optional focus, returning the new task id', async () => {
     let seen: { url: string; body: string } | undefined;
     installFetchMock(async (url, init) => {
       seen = { url, body: String(init?.body) };
-      return new Response('{}', { status: 200 });
+      return new Response(JSON.stringify({ message: 'Conversation handed off', taskId: 'task-2' }), { status: 200 });
     });
-    await handoffConversation('localhost', 24337, '/proj', 'task-1', 'finish the refactor');
+    const newTaskId = await handoffConversation('localhost', 24337, '/proj', 'task-1', 'finish the refactor');
     expect(seen?.url).toContain('/api/project/handoff-conversation');
     expect(JSON.parse(seen?.body ?? '')).toEqual({
       projectDir: '/proj',
       taskId: 'task-1',
       focus: 'finish the refactor',
     });
+    expect(newTaskId).toBe('task-2');
   });
 
-  test('omits focus when not supplied', async () => {
+  test('omits focus when not supplied and resolves undefined without a task id', async () => {
     let seen: { url: string; body: string } | undefined;
     installFetchMock(async (url, init) => {
       seen = { url, body: String(init?.body) };
-      return new Response('{}', { status: 200 });
+      return new Response(JSON.stringify({ message: 'Conversation handed off' }), { status: 200 });
     });
-    await handoffConversation('localhost', 24337, '/proj', 'task-1');
+    const newTaskId = await handoffConversation('localhost', 24337, '/proj', 'task-1');
     expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', taskId: 'task-1' });
+    expect(newTaskId).toBeUndefined();
   });
 });

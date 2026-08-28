@@ -30,7 +30,7 @@ changes.
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 108 tests across 6 files
+bun test            # bun:test suite — 113 tests across 6 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
