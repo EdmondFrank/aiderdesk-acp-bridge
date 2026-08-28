@@ -181,7 +181,10 @@ describe('AcpAgent', () => {
 
     const result = await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
 
-    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(result).toEqual({
+      stopReason: 'end_turn',
+      usage: { totalTokens: 30, inputTokens: 10, outputTokens: 20 },
+    });
 
     const updates = notifyCalls
       .filter((c) => c.method === acp.methods.client.session.update)
@@ -216,6 +219,51 @@ describe('AcpAgent', () => {
     const usageParams = usageUpdate.params as { update: { used: number; cost?: { amount: number; currency: string } } };
     expect(usageParams.update.used).toBe(30); // sent + received + cacheRead
     expect(usageParams.update.cost).toEqual({ amount: 0.5, currency: 'USD' });
+  });
+
+  test('prompt accumulates session usage across turns', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'response-completed',
+            data: {
+              messageId: 'm1',
+              usageReport: { sentTokens: 10, receivedTokens: 5, cacheReadTokens: 3, cacheWriteTokens: 2 },
+            },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200, headers: { 'x-task-id': 'task-123' } },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const first = await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'first' }] }, cx);
+    const second = await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'second' }] }, cx);
+
+    expect(first.usage).toEqual({
+      totalTokens: 20,
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedReadTokens: 3,
+      cachedWriteTokens: 2,
+    });
+    expect(second.usage).toEqual({
+      totalTokens: 40,
+      inputTokens: 20,
+      outputTokens: 10,
+      cachedReadTokens: 6,
+      cachedWriteTokens: 4,
+    });
   });
 
   test('prompt returns end_turn immediately for empty content', async () => {

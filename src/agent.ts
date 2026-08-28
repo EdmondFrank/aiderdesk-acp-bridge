@@ -91,6 +91,14 @@ function getVersion(): string {
   return pkg.version ?? '0.0.0';
 }
 
+/** Session-cumulative token usage, accumulated from per-turn `usageReport` events. */
+export type AcpSessionUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cachedWriteTokens: number;
+};
+
 export type AcpSession = {
   cwd: string;
   taskId?: string;
@@ -102,6 +110,7 @@ export type AcpSession = {
   allModes: ModeOption[];
   agentProfiles: AgentProfileInfo[];
   commands: CommandsData;
+  usage: AcpSessionUsage;
 };
 
 export class AcpAgent {
@@ -154,6 +163,7 @@ export class AcpAgent {
       allModes,
       agentProfiles,
       commands,
+      usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     });
 
     const configOptions = buildConfigOptions(
@@ -332,7 +342,7 @@ export class AcpAgent {
     }
     session.sseStream = sseResponse.stream;
 
-    return relaySse(sessionId, promptText, sseResponse.stream, cx, abortController);
+    return relaySse(session, sessionId, promptText, sseResponse.stream, cx, abortController);
   }
 
   /**
@@ -502,8 +512,11 @@ export class AcpAgent {
 /**
  * Relay AiderDesk SSE events as ACP session updates until the stream ends or
  * is aborted. Used by both regular prompts and expanded custom commands.
+ * Per-turn `usageReport` events are accumulated into the session so the final
+ * response can carry a session-cumulative `usage` (ACP experimental field).
  */
 async function relaySse(
+  session: AcpSession,
   sessionId: string,
   promptText: string,
   stream: ReadableStream<Uint8Array>,
@@ -566,6 +579,10 @@ async function relaySse(
         }
         if (eventData.usageReport) {
           const usage = eventData.usageReport;
+          session.usage.inputTokens += usage.sentTokens ?? 0;
+          session.usage.outputTokens += usage.receivedTokens ?? 0;
+          session.usage.cachedReadTokens += usage.cacheReadTokens ?? 0;
+          session.usage.cachedWriteTokens += usage.cacheWriteTokens ?? 0;
           await cx.notify(acp.methods.client.session.update, {
             sessionId,
             update: {
@@ -677,21 +694,39 @@ async function relaySse(
       }
 
       case 'stream-end': {
-        return { stopReason: 'end_turn' };
+        return withUsage(session, { stopReason: 'end_turn' });
       }
 
       case 'error': {
         process.stderr.write(`Server error: ${eventData.error || 'Unknown error'}\n`);
-        return { stopReason: 'end_turn' };
+        return withUsage(session, { stopReason: 'end_turn' });
       }
     }
   }
 
   if (abortController.signal.aborted) {
-    return { stopReason: 'cancelled' };
+    return withUsage(session, { stopReason: 'cancelled' });
   }
 
-  return { stopReason: 'end_turn' };
+  return withUsage(session, { stopReason: 'end_turn' });
+}
+
+/** Attach the session-cumulative `usage` to a prompt response when any tokens were used. */
+function withUsage(session: AcpSession, base: { stopReason: acp.PromptResponse['stopReason'] }): acp.PromptResponse {
+  const { inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens } = session.usage;
+  if (inputTokens === 0 && outputTokens === 0 && cachedReadTokens === 0 && cachedWriteTokens === 0) {
+    return base;
+  }
+  return {
+    ...base,
+    usage: {
+      totalTokens: inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens,
+      inputTokens,
+      outputTokens,
+      ...(cachedReadTokens > 0 ? { cachedReadTokens } : {}),
+      ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
+    },
+  };
 }
 
 /** Send a plain-text agent thought to the client (used for local errors). */

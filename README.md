@@ -20,7 +20,8 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   into the corresponding AiderDesk REST calls
 - SSE event translation: response chunks, reasoning, tool calls, usage updates,
   session info, cancellation — including `agent_thought_chunk`, `agent_message_chunk`,
-  `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications
+  `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications;
+  `session/prompt` responses carry session-cumulative token usage (ACP experimental `usage`)
 - Single-file compiled binary via `bun build --compile`
 
 ## Requirements

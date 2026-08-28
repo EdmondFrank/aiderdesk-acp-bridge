@@ -14,6 +14,9 @@ Two directions of translation — keep both sides in mind when changing code:
 
 1. **ACP in → AiderDesk out**: ACP requests (`initialize`, `session/new`,
    `session/set_config_option`, `session/prompt`, `session/cancel`) become REST calls.
+   `session/prompt` responses include the ACP experimental `usage` field — a
+   session-cumulative tally accumulated from per-turn `usageReport` SSE events
+   (per `AcpSession.usage`); the `usage_update` notification remains per-turn.
 2. **AiderDesk out → ACP out**: AiderDesk SSE events become ACP `session/update`
    notifications (`agent_thought_chunk`, `agent_message_chunk`, `tool_call`,
    `tool_call_update`, `usage_update`, `session_info_update`,
