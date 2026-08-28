@@ -4,10 +4,15 @@ import {
   callInterrupt,
   compactConversation,
   createTask,
+  deleteTask,
+  ensureProjectOpen,
   fetchJSON,
   fetchTask,
   handoffConversation,
+  listTasks,
+  loadTask,
   requestSSEStream,
+  resumeTask,
   runCustomCommand,
   smartCompactConversation,
 } from '../src/http';
@@ -223,5 +228,133 @@ describe('handoffConversation', () => {
     const newTaskId = await handoffConversation('localhost', 24337, '/proj', 'task-1');
     expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', taskId: 'task-1' });
     expect(newTaskId).toBeUndefined();
+  });
+});
+
+describe('ensureProjectOpen', () => {
+  test('POSTs the project dir to add-open', async () => {
+    let seen: { url: string; body: string } | undefined;
+    installFetchMock(async (url, init) => {
+      seen = { url, body: String(init?.body) };
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    await ensureProjectOpen('localhost', 24337, '/proj');
+    expect(seen?.url).toContain('/api/project/add-open');
+    expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj' });
+  });
+
+  test('swallows failures', async () => {
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    await expect(ensureProjectOpen('localhost', 24337, '/proj')).resolves.toBeUndefined();
+  });
+});
+
+describe('listTasks', () => {
+  test('GETs the tasks endpoint with projectDir and maps task summaries', async () => {
+    let seenUrl = '';
+    installFetchMock(async (url) => {
+      seenUrl = url;
+      return new Response(
+        JSON.stringify([
+          { id: 'task-1', baseDir: '/proj', name: 'Fix login', state: 'completed', archived: false, updatedAt: '2026-08-28T10:00:00Z' },
+          { id: 'task-2', baseDir: '/proj', name: '', updatedAt: '2026-08-27T09:00:00Z' },
+        ]),
+        { status: 200 },
+      );
+    });
+    const tasks = await listTasks('localhost', 24337, '/proj');
+    expect(seenUrl).toContain('/api/project/tasks');
+    expect(seenUrl).toContain(`projectDir=${encodeURIComponent('/proj')}`);
+    expect(tasks).toEqual([
+      { id: 'task-1', baseDir: '/proj', name: 'Fix login', state: 'completed', archived: false, updatedAt: '2026-08-28T10:00:00Z' },
+      { id: 'task-2', baseDir: '/proj', name: '', updatedAt: '2026-08-27T09:00:00Z' },
+    ]);
+  });
+
+  test('returns an empty list on non-200 responses and failures', async () => {
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    expect(await listTasks('localhost', 24337, '/proj')).toEqual([]);
+
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    expect(await listTasks('localhost', 24337, '/proj')).toEqual([]);
+  });
+});
+
+describe('loadTask', () => {
+  test('POSTs to tasks/load and returns the conversation messages', async () => {
+    let seen: { url: string; body: string } | undefined;
+    installFetchMock(async (url, init) => {
+      seen = { url, body: String(init?.body) };
+      return new Response(
+        JSON.stringify({
+          messages: [
+            { type: 'user', id: 'u1', content: 'hello' },
+            { type: 'response-completed', messageId: 'r1', content: 'hi there' },
+          ],
+        }),
+        { status: 200 },
+      );
+    });
+    const state = await loadTask('localhost', 24337, '/proj', 'task-1');
+    expect(seen?.url).toContain('/api/project/tasks/load');
+    expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', id: 'task-1' });
+    expect(state?.messages).toHaveLength(2);
+  });
+
+  test('returns undefined on non-200 responses and failures', async () => {
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+
+    installFetchMock(async () => new Response(JSON.stringify({}), { status: 200 }));
+    expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+  });
+});
+
+describe('resumeTask', () => {
+  test('POSTs projectDir and taskId to resume-task', async () => {
+    let seen: { url: string; body: string } | undefined;
+    installFetchMock(async (url, init) => {
+      seen = { url, body: String(init?.body) };
+      return new Response(JSON.stringify({ message: 'Task resumed' }), { status: 200 });
+    });
+    await resumeTask('localhost', 24337, '/proj', 'task-1');
+    expect(seen?.url).toContain('/api/project/resume-task');
+    expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', taskId: 'task-1' });
+  });
+
+  test('swallows failures', async () => {
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    await expect(resumeTask('localhost', 24337, '/proj', 'task-1')).resolves.toBeUndefined();
+  });
+});
+
+describe('deleteTask', () => {
+  test('POSTs projectDir and id to tasks/delete', async () => {
+    let seen: { url: string; body: string } | undefined;
+    installFetchMock(async (url, init) => {
+      seen = { url, body: String(init?.body) };
+      return new Response(JSON.stringify({ message: 'Task deleted' }), { status: 200 });
+    });
+    await deleteTask('localhost', 24337, '/proj', 'task-1');
+    expect(seen?.url).toContain('/api/project/tasks/delete');
+    expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', id: 'task-1' });
+  });
+
+  test('swallows failures', async () => {
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    await expect(deleteTask('localhost', 24337, '/proj', 'task-1')).resolves.toBeUndefined();
   });
 });

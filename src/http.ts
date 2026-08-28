@@ -130,6 +130,132 @@ export async function callInterrupt(host: string, port: number, projectDir: stri
 }
 
 /**
+ * Ensure a project is open on the AiderDesk server (`POST /api/project/add-open`).
+ * Task listing and creation require the project to be open. Best-effort: failures
+ * are swallowed so callers degrade gracefully.
+ */
+export async function ensureProjectOpen(host: string, port: number, projectDir: string): Promise<void> {
+  try {
+    await fetchJSON(host, port, '/api/project/add-open', 'POST', JSON.stringify({ projectDir }));
+  } catch {
+    // best-effort
+  }
+}
+
+/** Summary of a task as exposed by `GET /api/project/tasks`, used for listings. */
+export type TaskSummary = {
+  id: string;
+  baseDir: string;
+  name: string;
+  state?: string;
+  archived?: boolean;
+  updatedAt?: string;
+};
+
+/**
+ * List the tasks for a project via `GET /api/project/tasks`.
+ * Returns an empty list on any failure so callers degrade gracefully.
+ */
+export async function listTasks(
+  host: string,
+  port: number,
+  projectDir: string,
+): Promise<TaskSummary[]> {
+  try {
+    const response = await fetchJSON(
+      host,
+      port,
+      `/api/project/tasks?projectDir=${encodeURIComponent(projectDir)}`,
+      'GET',
+    );
+    if (response.status !== 200) {
+      return [];
+    }
+    const tasks = response.data as TaskSummary[];
+    return Array.isArray(tasks)
+      ? tasks.map((t) => ({
+          id: t.id,
+          baseDir: t.baseDir,
+          name: t.name,
+          ...(t.state ? { state: t.state } : {}),
+          ...(typeof t.archived === 'boolean' ? { archived: t.archived } : {}),
+          ...(t.updatedAt ? { updatedAt: t.updatedAt } : {}),
+        }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** A stored conversation message, as returned by `POST /api/project/tasks/load`. */
+export type TaskStateMessage = {
+  type: string;
+  messageId?: string;
+  id?: string;
+  content?: string;
+  reasoning?: string;
+  toolName?: string;
+  serverName?: string;
+  args?: unknown;
+  response?: string;
+  finished?: boolean;
+};
+
+/** Full state of a task (conversation messages) via `POST /api/project/tasks/load`. */
+export type TaskStateData = {
+  messages: TaskStateMessage[];
+};
+
+/**
+ * Load a task's full conversation state via `POST /api/project/tasks/load`.
+ * Returns `undefined` on any failure so callers degrade gracefully.
+ */
+export async function loadTask(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+): Promise<TaskStateData | undefined> {
+  try {
+    const response = await fetchJSON(
+      host,
+      port,
+      '/api/project/tasks/load',
+      'POST',
+      JSON.stringify({ projectDir, id: taskId }),
+    );
+    if (response.status !== 200) {
+      return undefined;
+    }
+    const data = response.data as { messages?: unknown } | undefined;
+    if (!data || !Array.isArray(data.messages)) {
+      return undefined;
+    }
+    return { messages: data.messages as TaskStateMessage[] };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Ask the AiderDesk server to resume a task (`POST /api/project/resume-task`, best-effort). */
+export async function resumeTask(host: string, port: number, projectDir: string, taskId: string): Promise<void> {
+  try {
+    await fetchJSON(host, port, '/api/project/resume-task', 'POST', JSON.stringify({ projectDir, taskId }));
+  } catch {
+    // best-effort
+  }
+}
+
+/** Delete a task (`POST /api/project/tasks/delete`, best-effort). */
+export async function deleteTask(host: string, port: number, projectDir: string, taskId: string): Promise<void> {
+  try {
+    await fetchJSON(host, port, '/api/project/tasks/delete', 'POST', JSON.stringify({ projectDir, id: taskId }));
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * Create a task for a project via `POST /api/project/tasks/new` and return
  * its id. Used to give extension commands (which have no expandable template)
  * a task to run against.

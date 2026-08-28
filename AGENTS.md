@@ -13,10 +13,13 @@ calls against the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`,
 Two directions of translation — keep both sides in mind when changing code:
 
 1. **ACP in → AiderDesk out**: ACP requests (`initialize`, `session/new`,
+   `session/list`, `session/load`, `session/resume`, `session/delete`,
    `session/set_config_option`, `session/prompt`, `session/cancel`) become REST calls.
    `session/prompt` responses include the ACP experimental `usage` field — a
    session-cumulative tally accumulated from per-turn `usageReport` SSE events
    (per `AcpSession.usage`); the `usage_update` notification remains per-turn.
+   `session/load` replays the task's stored conversation (`POST /api/project/tasks/load`)
+   as session updates inside the load request.
 2. **AiderDesk out → ACP out**: AiderDesk SSE events become ACP `session/update`
    notifications (`agent_thought_chunk`, `agent_message_chunk`, `tool_call`,
    `tool_call_update`, `usage_update`, `session_info_update`,
@@ -30,7 +33,7 @@ changes.
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 113 tests across 6 files
+bun test            # bun:test suite — 132 tests across 6 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -43,10 +46,10 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 
 | File | Responsibility |
 | --- | --- |
-| `src/index.ts` | CLI entry: arg parsing (`-p/--port`, `--host`, `-v`, `-h`, `AIDER_DESK_PORT` env), health check against `/api/health`, wraps `process.stdout` in a web `WritableStream` (Bun's `stdout.stream()` lacks `getWriter`), wires ACP methods and notifications to an `AcpAgent` over NDJSON stdio. |
-| `src/agent.ts` | `AcpAgent` class — the ACP lifecycle and session state (`Map<sessionId, AcpSession>`). `prompt()` is the dispatcher: built-in command → direct REST; file-based custom command → local template expansion + SSE prompt flow; extension command → server-side `custom-commands` (best effort); anything else → regular `POST /api/run-prompt` SSE flow. `relaySse()` translates SSE events into ACP notifications. |
-| `src/commands.ts` | Slash-command support: `fetchCommands` (`GET /api/project/commands`), command normalization/lookup, `BUILT_IN_COMMANDS` (`/new`, `/compact`, `/smart-compact`, `/handoff` + alias `/hand-off`), `parseCommandText`, argument substitution (`{{1}}`, `{{2}}`, `{{ARGUMENTS}}`), `!shell` line execution, template expansion. |
-| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `runCustomCommand`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers. |
+| `src/index.ts` | CLI entry: arg parsing (`-p/--port`, `--host`, `-v`, `-h`, `AIDER_DESK_PORT` env), health check against `/api/health`, wraps `process.stdout` in a web `WritableStream` (Bun's `stdout.stream()` lacks `getWriter`), wires ACP methods and notifications to an `AcpAgent` over NDJSON stdio (including `session/list`, `session/load`, `session/resume`, `session/delete`). |
+| `src/agent.ts` | `AcpAgent` class — the ACP lifecycle and session state (`Map<sessionId, AcpSession>`). Sessions map 1:1 to AiderDesk tasks: `newSession` eagerly creates the task (`add-open` + `tasks/new`) and uses the task id as the session id (falling back to a local id when creation fails). `listSessions`/`loadSession`/`resumeSession`/`deleteSession` implement ACP session management over the task API; `replayTaskMessages` streams a loaded conversation as session updates. `prompt()` is the dispatcher: built-in command → direct REST; file-based custom command → local template expansion + SSE prompt flow; extension command → server-side `custom-commands` (best effort); anything else → regular `POST /api/run-prompt` SSE flow. `relaySse()` translates SSE events into ACP notifications. |
+| `src/commands.ts` | Slash-command support: `fetchCommands` (`GET /api/project/commands`), command normalization/lookup, `BUILT_IN_COMMANDS` (`/new`, `/compact`, `/smart-compact`, `/handoff` + alias `/hand-off`, `/tasks`, `/load`), `parseCommandText`, argument substitution (`{{1}}`, `{{2}}`, `{{ARGUMENTS}}`), `!shell` line execution, template expansion. |
+| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `resumeTask`, `deleteTask`, `runCustomCommand`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers. |
 | `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project default profile, `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` selects). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
 | `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle`, `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
@@ -57,9 +60,12 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 
 1. Flatten content blocks into `promptText` + `images`; empty input → `end_turn`.
 2. `parseCommandText(promptText)` — if it is a slash command:
-   - **Built-in** (`/new`, `/compact`, `/smart-compact`, `/handoff`, alias `/hand-off`)
-     → `runBuiltInCommandPrompt`: direct REST call, never streamed, always `end_turn`;
-     compact/smart-compact/handoff require an existing `session.taskId`.
+   - **Built-in** (`/new`, `/tasks`, `/load`, `/compact`, `/smart-compact`,
+     `/handoff`, alias `/hand-off`) → `runBuiltInCommandPrompt`: direct REST
+     call, never streamed, always `end_turn`; compact/smart-compact/handoff
+     require an existing `session.taskId` (the eager task from `newSession`
+     counts). `/tasks` lists via `listTasks` (add-open first); `/load` resolves
+     a task id or `#n` listing index.
    - **Custom command with a template** → `runCustomCommandPrompt`:
      `validateRequiredArguments` → `expandCommandTemplate` (substitution + `!shell`) →
      stream through the regular run-prompt SSE flow with the command's
@@ -120,8 +126,13 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
 - **Extension commands never stream** (`/api/project/custom-commands` has no SSE
   stream); they are best-effort — failures only produce an `agent_thought_chunk` +
   stderr log, never an exception.
-- **`session.taskId` is sticky** — learned from the `x-task-id` header of the first
-  `run-prompt` response, or set by `/new`; reuse it for interrupt/compact/handoff.
+- **`session.taskId` is sticky and set eagerly** — `newSession` creates the task
+  up front (`add-open` + `tasks/new`) and uses its id as the ACP session id; the
+  thread-local `Map` key is therefore the server task id, so `session/list` and
+  `session/load` work across bridge restarts. When eager creation fails, the
+  bridge falls back to a generated `acp-` session id and learns `taskId` from
+  the `x-task-id` header of the first `run-prompt` response (or `/new`).
+  Reuse `session.taskId` for interrupt/compact/handoff.
 - **SSE relay must respect aborts** — `relaySse` checks `abortController.signal`
   on every event and returns `cancelled`; `cancel()` also aborts the SSE stream and
   fires `POST /api/project/interrupt`.
@@ -135,7 +146,9 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   `http.test.ts`, `modes.test.ts`, `sse.test.ts`, `tools.test.ts`.
 - The agent tests use a `createMockRouter()` fetch mock (`routes` + recorded `calls`,
   assert with `callsMatching(regexp)`) and `mockContext()` for `cx.notify` capture.
-  `test/helpers.ts` provides `selectById`.
+  The router falls back to default `add-open` / `tasks/new` responses (task id
+  `task-1`) for the session bootstrap, matched after explicit routes — override
+  them when the task id matters. `test/helpers.ts` provides `selectById`.
 - Unit-test the pure functions in `commands.ts` (parsing, substitution, shell
   expansion) directly; test the dispatch/relay behavior through `AcpAgent` with the
   mocked router and context, mirroring the real SSE event payloads.

@@ -18,11 +18,18 @@ import {
   callInterrupt,
   compactConversation,
   createTask,
+  deleteTask,
+  ensureProjectOpen,
   fetchTask,
   handoffConversation,
+  listTasks,
+  loadTask,
   requestSSEStream,
+  resumeTask,
   runCustomCommand,
   smartCompactConversation,
+  type TaskStateMessage,
+  type TaskSummary,
 } from './http';
 import type { TaskReadMessage } from './http';
 import {
@@ -128,8 +135,13 @@ export class AcpAgent {
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
         promptCapabilities: { image: true, embeddedContext: true },
+        sessionCapabilities: {
+          list: {},
+          delete: {},
+          resume: {},
+        },
       },
       agentInfo: {
         name: 'aiderdesk',
@@ -145,41 +157,36 @@ export class AcpAgent {
   }
 
   async newSession(params: acp.NewSessionRequest, cx: acp.AgentContext): Promise<acp.NewSessionResponse> {
-    const sessionId = generateSessionId();
     const cwd = params.cwd ?? '';
 
-    const [agentProfiles, customModes, projectDefaultProfileId, commands] = await Promise.all([
-      fetchAgentProfiles(this.host, this.port),
-      fetchCustomModes(this.host, this.port, cwd),
-      fetchDefaultAgentProfileId(this.host, this.port, cwd),
-      fetchCommands(this.host, this.port, cwd),
-    ]);
-    const allModes = getAllModes(customModes);
-    const defaultProfileId = resolveDefaultProfileId(agentProfiles, projectDefaultProfileId, this.lastAgentProfileId);
-
-    this.sessions.set(sessionId, {
-      cwd,
-      mode: DEFAULT_MODE,
-      agentProfileId: defaultProfileId,
-      autonomyMode: DEFAULT_AUTONOMY_MODE,
-      allModes,
-      agentProfiles,
-      commands,
-      usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
-    });
+    // Create the backing AiderDesk task eagerly so the ACP session id can be
+    // the server's persistent task id. That makes sessions show up in
+    // `session/list` and resumes across bridge restarts. Falls back to a local
+    // id (task created lazily on the first prompt) when the server is not
+    // available yet.
+    let taskId: string | undefined;
+    try {
+      await ensureProjectOpen(this.host, this.port, cwd);
+      taskId = await createTask(this.host, this.port, cwd);
+    } catch {
+      taskId = undefined;
+    }
+    const sessionId = taskId ?? generateSessionId();
+    const session = await this.createSession(cwd, taskId);
+    this.sessions.set(sessionId, session);
 
     const configOptions = buildConfigOptions(
-      allModes,
-      agentProfiles,
-      DEFAULT_MODE,
-      defaultProfileId,
-      DEFAULT_AUTONOMY_MODE,
+      session.allModes,
+      session.agentProfiles,
+      session.mode,
+      session.agentProfileId,
+      session.autonomyMode,
     );
 
     // Advertise slash commands once the session is created. The notification
     // is deferred so the session/new response is written to the client first
     // (a notification referencing an unknown session id would be dropped).
-    const availableCommands = toAvailableCommands(commands);
+    const availableCommands = toAvailableCommands(session.commands);
     if (availableCommands.length > 0) {
       setTimeout(() => {
         void cx
@@ -196,7 +203,35 @@ export class AcpAgent {
     return {
       sessionId,
       configOptions,
-      modes: buildModeState(allModes, DEFAULT_MODE),
+      modes: buildModeState(session.allModes, session.mode),
+    };
+  }
+
+  /**
+   * Build a fresh AcpSession for the given working directory, fetching agent
+   * profiles, custom modes, the project default profile and slash commands.
+   * `taskId` is the server task the session is bound to (its ACP session id).
+   */
+  private async createSession(cwd: string, taskId: string | undefined): Promise<AcpSession> {
+    const [agentProfiles, customModes, projectDefaultProfileId, commands] = await Promise.all([
+      fetchAgentProfiles(this.host, this.port),
+      fetchCustomModes(this.host, this.port, cwd),
+      fetchDefaultAgentProfileId(this.host, this.port, cwd),
+      fetchCommands(this.host, this.port, cwd),
+    ]);
+    const allModes = getAllModes(customModes);
+    const defaultProfileId = resolveDefaultProfileId(agentProfiles, projectDefaultProfileId, this.lastAgentProfileId);
+
+    return {
+      cwd,
+      taskId,
+      mode: DEFAULT_MODE,
+      agentProfileId: defaultProfileId,
+      autonomyMode: DEFAULT_AUTONOMY_MODE,
+      allModes,
+      agentProfiles,
+      commands,
+      usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     };
   }
 
@@ -230,6 +265,102 @@ export class AcpAgent {
     );
 
     return { configOptions };
+  }
+
+  /**
+   * List the AiderDesk tasks for a working directory as ACP sessions
+   * (`session/list`). Task ids are stable across bridge restarts, so any task
+   * can later be loaded with `session/load` from a fresh client session.
+   * Archived tasks are hidden; failures degrade to an empty list.
+   */
+  async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
+    const cwd = params.cwd ?? '';
+    await ensureProjectOpen(this.host, this.port, cwd);
+    const tasks = await listTasks(this.host, this.port, cwd);
+    return {
+      sessions: tasks
+        .filter((task) => task.archived !== true)
+        .map((task) => ({
+          sessionId: task.id,
+          cwd: task.baseDir || cwd,
+          ...(task.name ? { title: task.name } : {}),
+          ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
+        })),
+    };
+  }
+
+  /**
+   * Load an existing task into this process as an ACP session (`session/load`).
+   * The session id is the server task id, so loading from a fresh process just
+   * creates a session bound to that task. The stored conversation is replayed
+   * to the client as session updates so it can render the restored history.
+   */
+  async loadSession(params: acp.LoadSessionRequest, cx: acp.AgentContext): Promise<acp.LoadSessionResponse> {
+    const sessionId = params.sessionId;
+    const cwd = params.cwd ?? '';
+
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = await this.createSession(cwd, sessionId);
+      this.sessions.set(sessionId, session);
+    }
+
+    const state = await loadTask(this.host, this.port, session.cwd || cwd, sessionId);
+    if (state) {
+      await replayTaskMessages(sessionId, state.messages, cx);
+    }
+
+    return {
+      modes: buildModeState(session.allModes, session.mode),
+      configOptions: buildConfigOptions(
+        session.allModes,
+        session.agentProfiles,
+        session.mode,
+        session.agentProfileId,
+        session.autonomyMode,
+      ),
+    };
+  }
+
+  /**
+   * Resume a task (`session/resume`): bind the session to the task and ask the
+   * server to re-run the response to its last user message (best-effort).
+   */
+  async resumeSession(params: acp.ResumeSessionRequest, cx: acp.AgentContext): Promise<acp.ResumeSessionResponse> {
+    const sessionId = params.sessionId;
+    const cwd = params.cwd ?? '';
+
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = await this.createSession(cwd, sessionId);
+      this.sessions.set(sessionId, session);
+    }
+
+    await resumeTask(this.host, this.port, session.cwd || cwd, sessionId);
+
+    return {
+      modes: buildModeState(session.allModes, session.mode),
+      configOptions: buildConfigOptions(
+        session.allModes,
+        session.agentProfiles,
+        session.mode,
+        session.agentProfileId,
+        session.autonomyMode,
+      ),
+    };
+  }
+
+  /**
+   * Delete a task (`session/delete`). Best-effort: tasks whose working
+   * directory is unknown (loaded outside this bridge process) are left alone.
+   */
+  async deleteSession(params: acp.DeleteSessionRequest): Promise<void> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session?.cwd) {
+      return;
+    }
+    await deleteTask(this.host, this.port, session.cwd, params.sessionId);
+    this.sessions.delete(params.sessionId);
   }
 
   async prompt(params: acp.PromptRequest, cx: acp.AgentContext): Promise<acp.PromptResponse> {
@@ -436,6 +567,41 @@ export class AcpAgent {
           const taskId = await createTask(this.host, this.port, session.cwd, name);
           session.taskId = taskId;
           await notifyThought(cx, sessionId, `Started a new task${name ? `: ${name}` : ''}.`);
+          return { stopReason: 'end_turn' };
+        }
+        case 'tasks': {
+          await ensureProjectOpen(this.host, this.port, session.cwd);
+          const tasks = await listTasks(this.host, this.port, session.cwd);
+          if (tasks.length === 0) {
+            await notifyThought(cx, sessionId, 'No tasks for this project yet.');
+            return { stopReason: 'end_turn' };
+          }
+          await notifyThought(cx, sessionId, formatTaskList(tasks));
+          return { stopReason: 'end_turn' };
+        }
+        case 'load': {
+          const target = args[0];
+          if (!target) {
+            await notifyThought(cx, sessionId, "Usage: /load <task id or '#number from /tasks'>");
+            return { stopReason: 'end_turn' };
+          }
+          await ensureProjectOpen(this.host, this.port, session.cwd);
+          const tasks = await listTasks(this.host, this.port, session.cwd);
+          const task = resolveTask(tasks, target);
+          if (!task) {
+            await notifyThought(
+              cx,
+              sessionId,
+              `No task matching '${target}'. Run /tasks to see available tasks.`,
+            );
+            return { stopReason: 'end_turn' };
+          }
+          session.taskId = task.id;
+          await notifyThought(
+            cx,
+            sessionId,
+            `Loaded task ${formatTaskReference(task)}. A conversation is already in progress.`,
+          );
           return { stopReason: 'end_turn' };
         }
         case 'compact': {
@@ -743,6 +909,108 @@ async function relaySse(
   return withUsage(session, { stopReason: 'end_turn' });
 }
 
+/**
+ * Replay a task's stored conversation (`POST /api/project/tasks/load` messages)
+ * to the ACP client as session updates so it can render the restored session.
+ * User messages, assistant reasoning/content and tool calls map to the same
+ * update kinds the live SSE relay produces. Runs inside the `session/load`
+ * request, which is how ACP clients restore history.
+ */
+async function replayTaskMessages(
+  sessionId: string,
+  messages: TaskStateMessage[],
+  cx: acp.AgentContext,
+): Promise<void> {
+  for (const message of messages) {
+    switch (message.type) {
+      case 'user': {
+        if (message.id && message.content) {
+          await cx.notify(acp.methods.client.session.update, {
+            sessionId,
+            update: {
+              sessionUpdate: 'user_message_chunk',
+              messageId: message.id,
+              content: { type: 'text', text: message.content },
+            },
+          });
+        }
+        break;
+      }
+      case 'response-completed': {
+        if (message.reasoning) {
+          await cx.notify(acp.methods.client.session.update, {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              ...(message.messageId ? { messageId: message.messageId } : {}),
+              content: { type: 'text', text: message.reasoning },
+            },
+          });
+        }
+        if (message.content) {
+          await cx.notify(acp.methods.client.session.update, {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              ...(message.messageId ? { messageId: message.messageId } : {}),
+              content: { type: 'text', text: message.content },
+            },
+          });
+        }
+        break;
+      }
+      case 'tool': {
+        if (!message.id || !message.toolName) {
+          break;
+        }
+        const args = parseToolArgs(message.args);
+        const filePath = extractFilePath(message.toolName, args);
+        const inputText = formatToolInputAsText(message.toolName, args);
+        const title = formatToolTitle(message.toolName, args);
+
+        if (message.finished !== true) {
+          await cx.notify(acp.methods.client.session.update, {
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: message.id,
+              title,
+              kind: inferToolKind(message.toolName),
+              status: 'in_progress',
+              ...(message.args !== undefined ? { rawInput: message.args } : {}),
+              ...(filePath ? { locations: [{ path: filePath }] } : {}),
+              ...(inputText
+                ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: inputText } }] }
+                : {}),
+            },
+          });
+          break;
+        }
+
+        const responseData = parseToolResponse(message.response ?? '');
+        const failed = isToolFailed(message.toolName, responseData);
+        const contentArray = buildToolCallContentArray(message.toolName, args, responseData);
+        const fullContent: acp.ToolCallContent[] = [];
+        if (inputText) {
+          fullContent.push({ type: 'content', content: { type: 'text', text: inputText } });
+        }
+        fullContent.push(...contentArray);
+
+        await cx.notify(acp.methods.client.session.update, {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: message.id,
+            status: failed ? 'failed' : 'completed',
+            ...(fullContent.length > 0 ? { content: fullContent } : {}),
+          },
+        });
+        break;
+      }
+    }
+  }
+}
+
 /** Attach the session-cumulative `usage` to a prompt response when any tokens were used. */
 function withUsage(session: AcpSession, base: { stopReason: acp.PromptResponse['stopReason'] }): acp.PromptResponse {
   const { inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens } = session.usage;
@@ -770,6 +1038,50 @@ async function notifyThought(cx: acp.AgentContext, sessionId: string, text: stri
       content: { type: 'text', text },
     },
   });
+}
+
+/** Short human-readable form of an ISO timestamp (date + HH:MM in local time). */
+function formatTaskDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return iso.slice(0, 16);
+  }
+  return date.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+}
+
+/** Numbered, human-readable listing of a project's tasks (for the /tasks command). */
+function formatTaskList(tasks: TaskSummary[]): string {
+  const lines = tasks.map((task, index) => {
+    const state = task.state ? ` (${task.state})` : '';
+    const updated = task.updatedAt ? ` — updated ${formatTaskDate(task.updatedAt)}` : '';
+    return `${index + 1}. ${task.name || '(untitled)'} [${task.id}]${state}${updated}`;
+  });
+  return `Tasks (${tasks.length}):\n${lines.join('\n')}`;
+}
+
+/** Compact reference to a task, as used in /load feedback. */
+function formatTaskReference(task: TaskSummary): string {
+  return `${task.name || '(untitled)'} [${task.id}]`;
+}
+
+/**
+ * Resolve a /load target to a task: an exact id, a `#N`/`N` index into the
+ * listing shown by /tasks (1-based), or a unique id prefix.
+ */
+function resolveTask(tasks: TaskSummary[], target: string): TaskSummary | undefined {
+  const direct = tasks.find((task) => task.id === target);
+  if (direct) {
+    return direct;
+  }
+  const numberMatch = target.match(/^#?(\d+)$/);
+  if (numberMatch) {
+    const index = parseInt(numberMatch[1], 10) - 1;
+    if (index >= 0 && index < tasks.length) {
+      return tasks[index];
+    }
+  }
+  const prefix = tasks.filter((task) => task.id.startsWith(target));
+  return prefix.length === 1 ? prefix[0] : undefined;
 }
 
 /**

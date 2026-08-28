@@ -12,12 +12,18 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
 
 - Full ACP agent lifecycle: `initialize`, `authenticate`, `session/new`,
   `session/set_config_option`, `session/prompt`, `session/cancel`
+- ACP session management: `session/list`, `session/load`, `session/resume`,
+  `session/delete`. Sessions map 1:1 to AiderDesk tasks — a session is created
+  eagerly as a server task at `session/new` (its task id is the ACP session id),
+  so sessions survive bridge restarts: any ACP client can list tasks and restore
+  a conversation (`session/load` replays the stored conversation, which agent-shell
+  renders per its restore verbosity)
 - Mode / agent-profile / autonomy configuration surfaced as ACP session config options
 - Slash commands: custom commands (`~/.aider-desk/commands/` and
   `<project>/.aider-desk/commands/`) are advertised to ACP clients and executed
   with argument substitution and `!shell` support; built-in session-control
-  commands (`/new`, `/compact`, `/smart-compact`, `/handoff`) are translated
-  into the corresponding AiderDesk REST calls
+  commands (`/new`, `/compact`, `/smart-compact`, `/handoff`, `/tasks`, `/load`)
+  are translated into the corresponding AiderDesk REST calls
 - SSE event translation: response chunks, reasoning, tool calls, usage updates,
   session info, cancellation — including `agent_thought_chunk`, `agent_message_chunk`,
   `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications;
@@ -77,7 +83,11 @@ The port can also be set via the `AIDER_DESK_PORT` environment variable.
 
 | ACP method                      | AiderDesk REST call(s)                                             |
 | ------------------------------- | ------------------------------------------------------------------ |
-| `session/new`                   | `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` |
+| `session/new`                   | `POST /api/project/add-open`, `POST /api/project/tasks/new`, `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` — creates the backing task eagerly so the session id is a stable task id |
+| `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks`             |
+| `session/load`                  | `POST /api/project/tasks/load` (replays the stored conversation as session updates) |
+| `session/resume`                | `POST /api/project/resume-task`                                    |
+| `session/delete`                | `POST /api/project/tasks/delete`                                   |
 | `session/prompt`                | `POST /api/run-prompt` (SSE)                                       |
 | `session/cancel`                | aborts the SSE request + `POST /api/project/interrupt`             |
 
@@ -96,6 +106,8 @@ Commands are invoked by sending `/name arg1 arg2` as the prompt:
   | Command          | AiderDesk REST call                     | Notes                                              |
   | ---------------- | --------------------------------------- | -------------------------------------------------- |
   | `/new [name]`    | `POST /api/project/tasks/new`           | starts a new task and makes it the session's task  |
+  | `/tasks`         | `POST /api/project/add-open`, `GET /api/project/tasks` | lists the project's tasks as a numbered thought chunk |
+  | `/load <id\|#n>` | sets the session's task (via `GET /api/project/tasks`) | `#n` refers to the number shown by `/tasks`; a task id or unique id prefix also works |
   | `/compact [hint]`| `POST /api/project/compact-conversation`| requires an existing task                           |
   | `/smart-compact` | `POST /api/project/smart-compact-conversation` | requires an existing task                  |
   | `/handoff [focus]` / `/hand-off [focus]` | `POST /api/project/handoff-conversation` | requires an existing task; creates a new task and makes it the session's task |

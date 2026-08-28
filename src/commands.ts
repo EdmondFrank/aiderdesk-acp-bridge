@@ -158,6 +158,16 @@ export const BUILT_IN_COMMANDS: BridgeCommand[] = [
     description: 'Hand off the conversation with a focus note',
     arguments: [{ description: 'focus note', required: false }],
   },
+  {
+    name: 'tasks',
+    description: 'List the tasks for the current project',
+    arguments: [],
+  },
+  {
+    name: 'load',
+    description: 'Load a task (by id or the #number shown in /tasks)',
+    arguments: [{ description: 'task id or task number', required: true }],
+  },
 ];
 
 /** Extra spellings that map to a canonical built-in command. */

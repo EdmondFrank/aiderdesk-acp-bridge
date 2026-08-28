@@ -68,8 +68,10 @@ describe('toAvailableCommands', () => {
       { name: 'alpha', description: 'First one' },
       { name: 'compact', description: 'Compact the conversation', input: { hint: '1: custom compact instructions (optional)' } },
       { name: 'handoff', description: 'Hand off the conversation with a focus note', input: { hint: '1: focus note (optional)' } },
+      { name: 'load', description: 'Load a task (by id or the #number shown in /tasks)', input: { hint: '1: task id or task number' } },
       { name: 'new', description: 'Start a new task', input: { hint: '1: task name (optional)' } },
       { name: 'smart-compact', description: 'Compact the conversation with an AI-generated summary' },
+      { name: 'tasks', description: 'List the tasks for the current project' },
       { name: 'zeta', description: 'Last one' },
     ]);
   });
