@@ -6,6 +6,7 @@ import {
   createTask,
   deleteTask,
   ensureProjectOpen,
+  fetchInputHistory,
   fetchJSON,
   fetchTask,
   handoffConversation,
@@ -281,6 +282,33 @@ describe('listTasks', () => {
       throw new Error('connection refused');
     });
     expect(await listTasks('localhost', 24337, '/proj')).toEqual([]);
+  });
+});
+
+describe('fetchInputHistory', () => {
+  test('GETs the input-history endpoint with projectDir and returns entries', async () => {
+    let seenUrl = '';
+    installFetchMock(async (url) => {
+      seenUrl = url;
+      return new Response(JSON.stringify(['fix the failing test', 'review git staged diff']), { status: 200 });
+    });
+    const history = await fetchInputHistory('localhost', 24337, '/proj');
+    expect(seenUrl).toContain('/api/project/input-history');
+    expect(seenUrl).toContain(`projectDir=${encodeURIComponent('/proj')}`);
+    expect(history).toEqual(['fix the failing test', 'review git staged diff']);
+  });
+
+  test('drops non-string entries and returns [] on non-200 responses and failures', async () => {
+    installFetchMock(async () => new Response(JSON.stringify(['ok', 42, null]), { status: 200 }));
+    expect(await fetchInputHistory('localhost', 24337, '/proj')).toEqual(['ok']);
+
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    expect(await fetchInputHistory('localhost', 24337, '/proj')).toEqual([]);
+
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    expect(await fetchInputHistory('localhost', 24337, '/proj')).toEqual([]);
   });
 });
 

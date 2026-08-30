@@ -20,6 +20,7 @@ import {
   createTask,
   deleteTask,
   ensureProjectOpen,
+  fetchInputHistory,
   fetchTask,
   handoffConversation,
   listTasks,
@@ -265,6 +266,17 @@ export class AcpAgent {
     );
 
     return { configOptions };
+  }
+
+  /**
+   * List the AiderDesk input history entries for a working directory
+   * (`session/list_input_history`). Entries are the prompts the user has
+   * submitted in the project, newest first, fetched from the server's
+   * `GET /api/project/input-history`. Failures degrade to an empty list.
+   */
+  async listInputHistory(params: { cwd?: string }): Promise<{ inputs: string[] }> {
+    const cwd = params.cwd ?? '';
+    return { inputs: await fetchInputHistory(this.host, this.port, cwd) };
   }
 
   /**

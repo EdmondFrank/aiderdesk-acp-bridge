@@ -85,6 +85,7 @@ The port can also be set via the `AIDER_DESK_PORT` environment variable.
 | ------------------------------- | ------------------------------------------------------------------ |
 | `session/new`                   | `POST /api/project/add-open`, `POST /api/project/tasks/new`, `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` — creates the backing task eagerly so the session id is a stable task id |
 | `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks`             |
+| `session/list_input_history`    | `GET /api/project/input-history` (custom extension method; used by agent-shell's input-history command) |
 | `session/load`                  | `POST /api/project/tasks/load` (replays the stored conversation as session updates) |
 | `session/resume`                | `POST /api/project/resume-task`                                    |
 | `session/delete`                | `POST /api/project/tasks/delete`                                   |

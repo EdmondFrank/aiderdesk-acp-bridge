@@ -117,6 +117,14 @@ async function startAcpAgent(host: string, port: number): Promise<void> {
     .onRequest('session/delete', (ctx) => agentInstance.deleteSession(ctx.params))
     .onRequest('session/set_config_option', (ctx) => agentInstance.setConfigOption(ctx.params))
     .onRequest('session/prompt', (ctx) => agentInstance.prompt(ctx.params, ctx.client))
+    // Custom extension method backed by `GET /api/project/input-history`,
+    // used by agent-shell's input-history command. A passthrough params
+    // parser is required to register a non-standard ACP method.
+    .onRequest(
+      'session/list_input_history',
+      (params: unknown) => params as { cwd?: string },
+      (ctx) => agentInstance.listInputHistory(ctx.params),
+    )
     .onNotification('session/cancel', (ctx) => agentInstance.cancel(ctx.params))
     .connect(stream);
 

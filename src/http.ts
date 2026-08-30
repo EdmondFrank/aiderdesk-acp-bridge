@@ -124,6 +124,34 @@ export async function requestSSEStream(
   };
 }
 
+/**
+ * List a project's input history via `GET /api/project/input-history`.
+ * Entries are the prompts the user has submitted in the project
+ * (parsed by the server from `.aider.input.history`), newest first.
+ * Returns an empty list on any failure so callers degrade gracefully.
+ */
+export async function fetchInputHistory(
+  host: string,
+  port: number,
+  projectDir: string,
+): Promise<string[]> {
+  try {
+    const response = await fetchJSON(
+      host,
+      port,
+      `/api/project/input-history?projectDir=${encodeURIComponent(projectDir)}`,
+      'GET',
+    );
+    if (response.status !== 200) {
+      return [];
+    }
+    const history = response.data as string[];
+    return Array.isArray(history) ? history.filter((entry) => typeof entry === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 /** Ask the AiderDesk server to interrupt a running task (best-effort). */
 export async function callInterrupt(host: string, port: number, projectDir: string, taskId: string): Promise<void> {
   await fetchJSON(host, port, '/api/project/interrupt', 'POST', JSON.stringify({ projectDir, taskId }));

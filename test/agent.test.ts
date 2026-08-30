@@ -983,6 +983,29 @@ describe('AcpAgent', () => {
     expect(seenBody?.taskId).toBeUndefined();
   });
 
+  test('session/list_input_history returns the project input history', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/project/input-history', () =>
+      new Response(JSON.stringify(['fix the failing test', 'review git staged diff']), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const response = await agent.listInputHistory({ cwd: '/proj' });
+
+    expect(response).toEqual({ inputs: ['fix the failing test', 'review git staged diff'] });
+    expect(router.callsMatching(/\/api\/project\/input-history/)).toHaveLength(1);
+  });
+
+  test('session/list_input_history degrades to an empty list when the server is unavailable', async () => {
+    globalThis.fetch = (async () => {
+      throw new Error('connection refused');
+    }) as unknown as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    expect(await agent.listInputHistory({ cwd: '/proj' })).toEqual({ inputs: [] });
+  });
+
   test('session/list maps server tasks to session infos, hiding archived ones', async () => {
     const router = createMockRouter();
     router.add('GET', '/api/project/tasks', () =>
