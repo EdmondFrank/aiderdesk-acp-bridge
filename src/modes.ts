@@ -24,6 +24,35 @@ export async function fetchAgentProfiles(host: string, port: number): Promise<Ag
   }
 }
 
+export type ModelInfo = {
+  id: string;
+  providerId: string;
+  name?: string;
+};
+
+/**
+ * Fetch the provider models available on the AiderDesk server
+ * (`GET /api/models`). Returns an empty list on any failure so callers
+ * degrade gracefully.
+ */
+export async function fetchProviderModels(host: string, port: number): Promise<ModelInfo[]> {
+  try {
+    const response = await fetchJSON(host, port, '/api/models', 'GET');
+    if (response.status !== 200) return [];
+    const data = response.data as { models?: unknown } | undefined;
+    if (!data || !Array.isArray(data.models)) return [];
+    return (data.models as ModelInfo[])
+      .filter((m) => m && typeof m.id === 'string' && typeof m.providerId === 'string')
+      .map((m) => ({
+        id: m.id,
+        providerId: m.providerId,
+        ...(m.name ? { name: m.name } : {}),
+      }));
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchDefaultAgentProfileId(host: string, port: number, projectDir: string): Promise<string | undefined> {
   try {
     const response = await fetchJSON(host, port, `/api/project/settings?projectDir=${encodeURIComponent(projectDir)}`, 'GET');
@@ -92,6 +121,8 @@ export function buildConfigOptions(
   currentMode: string,
   currentProfileId: string | undefined,
   currentAutonomy: string,
+  models: ModelInfo[] = [],
+  currentModelId?: string,
 ): acp.SessionConfigOption[] {
   const options: acp.SessionConfigOption[] = [
     {
@@ -137,6 +168,21 @@ export function buildConfigOptions(
       ...(m.description ? { description: m.description } : {}),
     })),
   });
+
+  if (models.length > 0) {
+    const composed = (m: ModelInfo) => `${m.providerId}/${m.id}`;
+    options.push({
+      type: 'select',
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      currentValue: currentModelId ?? composed(models[0]!),
+      options: models.map((m) => ({
+        value: composed(m),
+        name: m.name ?? composed(m),
+      })),
+    });
+  }
 
   return options;
 }

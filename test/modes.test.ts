@@ -87,4 +87,46 @@ describe('buildConfigOptions', () => {
     const profileOption = selectById(options, 'agent_profile');
     expect(profileOption.currentValue).toBe('default');
   });
+
+  test('appends a model select with composed provider/model values when models are supplied', () => {
+    const models = [
+      { id: 'gpt-5', providerId: 'openai-compatible' },
+      { id: 'claude-sonnet-4', providerId: 'anthropic', name: 'Claude Sonnet 4' },
+    ];
+    const options = buildConfigOptions(
+      BUILT_IN_MODES,
+      profiles,
+      'agent',
+      'default',
+      'guided',
+      models,
+      'anthropic/claude-sonnet-4',
+    );
+    expect(options.map((o) => o.id)).toEqual(['chat_mode', 'agent_profile', 'autonomy_mode', 'model']);
+    const modelOption = selectById(options, 'model');
+    expect(modelOption.name).toBe('Model');
+    expect(modelOption.category).toBe('model');
+    expect(modelOption.currentValue).toBe('anthropic/claude-sonnet-4');
+    expect(modelOption.options).toEqual([
+      { value: 'openai-compatible/gpt-5', name: 'openai-compatible/gpt-5' },
+      { value: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4' },
+    ]);
+  });
+
+  test('defaults the model selection to the first model when none is current', () => {
+    const options = buildConfigOptions(
+      BUILT_IN_MODES,
+      profiles,
+      'agent',
+      'default',
+      'guided',
+      [{ id: 'gpt-5', providerId: 'openai-compatible' }],
+    );
+    expect(selectById(options, 'model').currentValue).toBe('openai-compatible/gpt-5');
+  });
+
+  test('omits the model select when no models are available or supplied', () => {
+    const options = buildConfigOptions(BUILT_IN_MODES, profiles, 'agent', 'default', 'guided');
+    expect(options.map((o) => o.id)).toEqual(['chat_mode', 'agent_profile', 'autonomy_mode']);
+  });
 });

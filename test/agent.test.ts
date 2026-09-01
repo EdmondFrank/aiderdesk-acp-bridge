@@ -41,6 +41,11 @@ function createMockRouter() {
       match: (url: string) => url.includes('/api/project/tasks/new'),
       handler: () => new Response(JSON.stringify({ id: 'task-1' }), { status: 200 }),
     },
+    {
+      method: 'GET',
+      match: (url: string) => url.includes('/api/models'),
+      handler: () => new Response('{"models":[]}', { status: 200 }),
+    },
   ];
 
   const router = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -384,6 +389,48 @@ describe('AcpAgent', () => {
     await expect(
       agent.setConfigOption({ sessionId: 'missing', configId: 'autonomy_mode', value: 'manual' }),
     ).rejects.toThrow('Session not found');
+  });
+
+  test('setConfigOption with model updates the selection and persists it to the task', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({
+          models: [
+            { id: 'gpt-5', providerId: 'openai-compatible' },
+            { id: 'claude-sonnet-4', providerId: 'anthropic', name: 'Claude Sonnet 4' },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', /\/api\/project\/tasks$/, () => new Response('{}', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const config = await agent.setConfigOption({
+      sessionId: session.sessionId,
+      configId: 'model',
+      value: 'openai-compatible/gpt-5',
+    });
+    expect(selectById(config.configOptions, 'model').currentValue).toBe('openai-compatible/gpt-5');
+
+    const taskUpdates = router.callsMatching(/\/api\/project\/tasks$/);
+    expect(taskUpdates).toHaveLength(1);
+    expect(JSON.parse(String(taskUpdates[0].init?.body))).toEqual({
+      projectDir: '/proj',
+      id: 'task-1',
+      updates: { provider: 'openai-compatible', model: 'gpt-5' },
+    });
   });
 
   test('prompt expands a custom command and streams it through run-prompt', async () => {

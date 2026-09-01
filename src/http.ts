@@ -311,6 +311,31 @@ export async function createTask(
   return data.id;
 }
 
+/**
+ * Update a task's model selection via `POST /api/project/tasks`. Best-effort:
+ * failures are swallowed so the in-memory session selection still applies.
+ */
+export async function updateTaskModel(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  provider: string,
+  model: string,
+): Promise<void> {
+  try {
+    await fetchJSON(
+      host,
+      port,
+      '/api/project/tasks',
+      'POST',
+      JSON.stringify({ projectDir, id: taskId, updates: { provider, model } }),
+    );
+  } catch {
+    // best-effort
+  }
+}
+
 /** Ask the AiderDesk server to run an extension command (best-effort). */
 export async function runCustomCommand(
   host: string,

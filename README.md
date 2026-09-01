@@ -18,7 +18,7 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   so sessions survive bridge restarts: any ACP client can list tasks and restore
   a conversation (`session/load` replays the stored conversation, which agent-shell
   renders per its restore verbosity)
-- Mode / agent-profile / autonomy configuration surfaced as ACP session config options
+- Mode / agent-profile / autonomy / model configuration surfaced as ACP session config options (model changes persist to the task via the REST API)
 - Slash commands: custom commands (`~/.aider-desk/commands/` and
   `<project>/.aider-desk/commands/`) are advertised to ACP clients and executed
   with argument substitution and `!shell` support; built-in session-control

@@ -16,6 +16,7 @@ import {
   resumeTask,
   runCustomCommand,
   smartCompactConversation,
+  updateTaskModel,
 } from '../src/http';
 
 const originalFetch = globalThis.fetch;
@@ -229,6 +230,32 @@ describe('handoffConversation', () => {
     const newTaskId = await handoffConversation('localhost', 24337, '/proj', 'task-1');
     expect(JSON.parse(seen?.body ?? '')).toEqual({ projectDir: '/proj', taskId: 'task-1' });
     expect(newTaskId).toBeUndefined();
+  });
+});
+
+describe('updateTaskModel', () => {
+  test('POSTs provider and model updates to the tasks endpoint', async () => {
+    let seen: { url: string; body: string } | undefined;
+    installFetchMock(async (url, init) => {
+      seen = { url, body: String(init?.body) };
+      return new Response('{}', { status: 200 });
+    });
+    await updateTaskModel('localhost', 24337, '/proj', 'task-1', 'openai-compatible', 'gpt-5');
+    expect(seen?.url).toContain('/api/project/tasks');
+    expect(JSON.parse(seen?.body ?? '')).toEqual({
+      projectDir: '/proj',
+      id: 'task-1',
+      updates: { provider: 'openai-compatible', model: 'gpt-5' },
+    });
+  });
+
+  test('swallows failures', async () => {
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    await expect(
+      updateTaskModel('localhost', 24337, '/proj', 'task-1', 'openai-compatible', 'gpt-5'),
+    ).resolves.toBeUndefined();
   });
 });
 

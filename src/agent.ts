@@ -29,6 +29,7 @@ import {
   resumeTask,
   runCustomCommand,
   smartCompactConversation,
+  updateTaskModel,
   type TaskStateMessage,
   type TaskSummary,
 } from './http';
@@ -39,10 +40,12 @@ import {
   fetchAgentProfiles,
   fetchCustomModes,
   fetchDefaultAgentProfileId,
+  fetchProviderModels,
   getAllModes,
   isAgentProfileVisible,
   resolveDefaultProfileId,
   type AgentProfileInfo,
+  type ModelInfo,
 } from './modes';
 import { parseSSEEvents } from './sse';
 import {
@@ -119,6 +122,8 @@ export type AcpSession = {
   autonomyMode: string;
   allModes: ModeOption[];
   agentProfiles: AgentProfileInfo[];
+  models: ModelInfo[];
+  model?: string;
   commands: CommandsData;
   usage: AcpSessionUsage;
 };
@@ -182,6 +187,8 @@ export class AcpAgent {
       session.mode,
       session.agentProfileId,
       session.autonomyMode,
+      session.models,
+      session.model,
     );
 
     // Advertise slash commands once the session is created. The notification
@@ -210,15 +217,17 @@ export class AcpAgent {
 
   /**
    * Build a fresh AcpSession for the given working directory, fetching agent
-   * profiles, custom modes, the project default profile and slash commands.
-   * `taskId` is the server task the session is bound to (its ACP session id).
+   * profiles, custom modes, the project default profile, provider models and
+   * slash commands. `taskId` is the server task the session is bound to (its
+   * ACP session id).
    */
   private async createSession(cwd: string, taskId: string | undefined): Promise<AcpSession> {
-    const [agentProfiles, customModes, projectDefaultProfileId, commands] = await Promise.all([
+    const [agentProfiles, customModes, projectDefaultProfileId, commands, models] = await Promise.all([
       fetchAgentProfiles(this.host, this.port),
       fetchCustomModes(this.host, this.port, cwd),
       fetchDefaultAgentProfileId(this.host, this.port, cwd),
       fetchCommands(this.host, this.port, cwd),
+      fetchProviderModels(this.host, this.port),
     ]);
     const allModes = getAllModes(customModes);
     const defaultProfileId = resolveDefaultProfileId(agentProfiles, projectDefaultProfileId, this.lastAgentProfileId);
@@ -231,6 +240,7 @@ export class AcpAgent {
       autonomyMode: DEFAULT_AUTONOMY_MODE,
       allModes,
       agentProfiles,
+      models,
       commands,
       usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     };
@@ -255,6 +265,28 @@ export class AcpAgent {
       case 'autonomy_mode':
         session.autonomyMode = value;
         break;
+      case 'model': {
+        session.model = value;
+        // Value is the composed "provider/model" advertised by the config
+        // option; persist it to the task when we have one. Best-effort: the
+        // in-memory selection still applies if persistence fails.
+        const separatorIndex = value.indexOf('/');
+        if (session.taskId && separatorIndex > 0 && separatorIndex < value.length - 1) {
+          try {
+            await updateTaskModel(
+              this.host,
+              this.port,
+              session.cwd,
+              session.taskId,
+              value.slice(0, separatorIndex),
+              value.slice(separatorIndex + 1),
+            );
+          } catch {
+            // best-effort
+          }
+        }
+        break;
+      }
     }
 
     const configOptions = buildConfigOptions(
@@ -263,6 +295,8 @@ export class AcpAgent {
       session.mode,
       session.agentProfileId,
       session.autonomyMode,
+      session.models,
+      session.model,
     );
 
     return { configOptions };
@@ -330,6 +364,8 @@ export class AcpAgent {
         session.mode,
         session.agentProfileId,
         session.autonomyMode,
+        session.models,
+        session.model,
       ),
     };
   }
@@ -358,6 +394,8 @@ export class AcpAgent {
         session.mode,
         session.agentProfileId,
         session.autonomyMode,
+        session.models,
+        session.model,
       ),
     };
   }
