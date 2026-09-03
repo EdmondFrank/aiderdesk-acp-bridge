@@ -18,6 +18,21 @@ export function resolvePort(port: number | undefined): number {
   return port ?? getDefaultPort();
 }
 
+/**
+ * Read a duration in milliseconds from the environment, falling back to
+ * `fallbackMs` when the variable is unset, blank, not a number, or not
+ * positive. A bad value degrades to the default rather than disabling a
+ * timeout altogether.
+ */
+export function getTimeoutFromEnv(envName: string, fallbackMs: number): number {
+  const raw = process.env[envName];
+  if (!raw) {
+    return fallbackMs;
+  }
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs;
+}
+
 export type ModeOption = {
   id: string;
   name: string;

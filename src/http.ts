@@ -1,5 +1,22 @@
-const JSON_TIMEOUT_MS = 10_000;
-const SSE_CONNECT_TIMEOUT_MS = 600_000;
+import { getTimeoutFromEnv } from './constants';
+
+/** Default budget for plain JSON REST calls, which never wait on the model. */
+const DEFAULT_JSON_TIMEOUT_MS = 10_000;
+
+/**
+ * Default budget for model-waiting calls: opening an SSE turn
+ * (`POST /api/run-prompt`) and the compaction/handoff endpoints that block
+ * until the model answers. The deadline covers the *whole* request lifetime,
+ * so it caps total turn duration, not just connection time; 30 minutes matches
+ * the AiderDesk server's own outbound provider timeout.
+ */
+const DEFAULT_SSE_TIMEOUT_MS = 30 * 60_000;
+
+/** Overridable with `AIDER_DESK_JSON_TIMEOUT_MS` (milliseconds). */
+export const JSON_TIMEOUT_MS = getTimeoutFromEnv('AIDER_DESK_JSON_TIMEOUT_MS', DEFAULT_JSON_TIMEOUT_MS);
+
+/** Overridable with `AIDER_DESK_SSE_TIMEOUT_MS` (milliseconds). */
+export const SSE_CONNECT_TIMEOUT_MS = getTimeoutFromEnv('AIDER_DESK_SSE_TIMEOUT_MS', DEFAULT_SSE_TIMEOUT_MS);
 
 export type JsonResponse = {
   status: number;
@@ -94,6 +111,8 @@ export type SSEStreamResult = {
  * Resolves once response headers arrive and the task id is known.
  * Supported endpoints: `/api/run-prompt` and (for extension commands)
  * `/api/project/custom-commands` when the server streams events back.
+ * `SSE_CONNECT_TIMEOUT_MS` bounds the entire request, including body
+ * consumption, so a turn still streaming when the deadline fires is aborted.
  */
 export async function requestSSEStream(
   host: string,

@@ -64,7 +64,24 @@ bun run build
 | `-v, --version`    | Print version                                        |                    |
 | `-h, --help`       | Show help                                            |                    |
 
-The port can also be set via the `AIDER_DESK_PORT` environment variable.
+### Environment variables
+
+| Variable                       | Description                                                        | Default          |
+| ------------------------------ | ------------------------------------------------------------------ | ---------------- |
+| `AIDER_DESK_PORT`              | AiderDesk server port (overridden by `--port`)                      | `24337`          |
+| `AIDER_DESK_JSON_TIMEOUT_MS`   | Timeout for plain JSON REST calls that never wait on the model      | `10000`          |
+| `AIDER_DESK_SSE_TIMEOUT_MS`    | Timeout for streaming turns (`session/prompt`) and for model-waiting calls (`/compact`, `/smart-compact`, `/handoff`) | `1800000` (30 min) |
+
+Timeouts are read once at startup and are expressed in milliseconds.
+`AIDER_DESK_SSE_TIMEOUT_MS` bounds the *whole* turn — it is not a connect-only
+deadline — so a long agent turn that is still streaming when the deadline fires
+is aborted. Values are capped at the AiderDesk server's own 30-minute provider
+timeout, which is why that is the default here.
+
+```sh
+# Allow unusually long turns (60 minutes) before the bridge aborts the stream
+AIDER_DESK_SSE_TIMEOUT_MS=3600000 aiderdesk-acp-bridge
+```
 
 ### Typical client configuration
 
@@ -73,7 +90,9 @@ The port can also be set via the `AIDER_DESK_PORT` environment variable.
   "mcpServers": {
     "aiderdesk": {
       "command": "aiderdesk-acp-bridge",
-      "args": []
+      "args": [],
+      // optional: raise the per-turn streaming budget
+      "env": { "AIDER_DESK_SSE_TIMEOUT_MS": "3600000" }
     }
   }
 }

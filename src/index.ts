@@ -17,6 +17,11 @@ Options:
       --host <host>   AiderDesk server host (default: ${DEFAULT_HOST})
   -v, --version       Print version
   -h, --help          Show this help
+
+Environment:
+  AIDER_DESK_JSON_TIMEOUT_MS   Timeout for plain JSON REST calls (default: 10000)
+  AIDER_DESK_SSE_TIMEOUT_MS    Timeout for streaming turns and model-waiting
+                               calls; bounds the whole turn (default: 1800000)
 `);
 }
 

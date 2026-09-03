@@ -99,7 +99,9 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
 - **Error reporting to clients** goes through `notifyThought()` /
   `agent_thought_chunk`; internal diagnostics go to `process.stderr.write`.
 - **Constants over magic numbers**, with numeric separators (`30_000`). Timeouts live
-  in `http.ts` (`JSON_TIMEOUT_MS` = 10s, `SSE_CONNECT_TIMEOUT_MS` = 600s).
+  in `http.ts` as env-overridable constants (`JSON_TIMEOUT_MS` = 10s,
+  `SSE_CONNECT_TIMEOUT_MS` = 30 min, via `AIDER_DESK_JSON_TIMEOUT_MS` /
+  `AIDER_DESK_SSE_TIMEOUT_MS` parsed by `getTimeoutFromEnv` in `constants.ts`).
 - **Timeout-aware requests.** Any endpoint that may wait on the model (compact,
   smart-compact, handoff) must pass `SSE_CONNECT_TIMEOUT_MS` to `fetchJSON`.
 - **Optional fields are spread conditionally** (`...(name ? { name } : {})`),
@@ -137,8 +139,15 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   on every event and returns `cancelled`; `cancel()` also aborts the SSE stream and
   fires `POST /api/project/interrupt`.
 - When adding a new AiderDesk endpoint that may wait on the model, give it a named
-  helper in `http.ts` and pass `SSE_CONNECT_TIMEOUT_MS` (600s) to `fetchJSON`, not
+  helper in `http.ts` and pass `SSE_CONNECT_TIMEOUT_MS` (30 min) to `fetchJSON`, not
   the default 10s JSON timeout.
+- **The SSE timeout bounds the whole turn, not just the connection.**
+  `AbortSignal.timeout` is handed to `fetch`, so in Bun it also aborts an in-flight
+  response body: a turn still streaming when the deadline fires dies as
+  `TimeoutError: The operation timed out.`, which the ACP SDK reports to clients as
+  `-32603 Internal error` with that string in `data.details`. Raise
+  `AIDER_DESK_SSE_TIMEOUT_MS` for long-running agents; the AiderDesk server itself
+  allows 30 minutes per provider response (`src/main/network-manager.ts`).
 
 ## Testing
 
