@@ -1,5 +1,5 @@
 export const DEFAULT_HOST = 'localhost';
-export const DEFAULT_PORT = 24337;
+export const DEFAULT_PORT = 23456;
 
 export function getPortFromEnv(): number | null {
   const envPort = process.env.AIDER_DESK_PORT;

@@ -44,22 +44,22 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
 bun install
 
 # Run from source (pipe into an ACP client)
-bun run dev -- --port 24337
+bun run dev -- --port 23456
 
 # Or install the CLI
 bun link
-aiderdesk-acp-bridge --port 24337
+aiderdesk-acp-bridge --port 23456
 
 # Build a single standalone executable
 bun run build
-./dist/aiderdesk-acp-bridge --port 24337
+./dist/aiderdesk-acp-bridge --port 23456
 ```
 
 ### Options
 
 | Option             | Description                                          | Default            |
 | ------------------ | ---------------------------------------------------- | ------------------ |
-| `-p, --port <port>`| AiderDesk server port                                | `24337`            |
+| `-p, --port <port>`| AiderDesk server port                                | `23456`            |
 | `--host <host>`    | AiderDesk server host                                | `localhost`        |
 | `-v, --version`    | Print version                                        |                    |
 | `-h, --help`       | Show help                                            |                    |
@@ -68,7 +68,7 @@ bun run build
 
 | Variable                       | Description                                                        | Default          |
 | ------------------------------ | ------------------------------------------------------------------ | ---------------- |
-| `AIDER_DESK_PORT`              | AiderDesk server port (overridden by `--port`)                      | `24337`          |
+| `AIDER_DESK_PORT`              | AiderDesk server port (overridden by `--port`)                      | `23456`          |
 | `AIDER_DESK_JSON_TIMEOUT_MS`   | Timeout for plain JSON REST calls that never wait on the model      | `10000`          |
 | `AIDER_DESK_SSE_TIMEOUT_MS`    | Timeout for streaming turns (`session/prompt`) and for model-waiting calls (`/compact`, `/smart-compact`, `/handoff`) | `1800000` (30 min) |
 
