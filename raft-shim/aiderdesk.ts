@@ -19,11 +19,32 @@
  * file only proxies stdin/stdout and rewrites a few messages.
  */
 
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const SHIM_VERSION = readBridgeVersion();
 const DEFAULT_PORT = 23456;
+
+/**
+ * AiderDesk defaults to `guided`: tools run, but a plan needs approval. Raft
+ * has no approval surface (the bridge never answers `ask-question`), so a
+ * guided turn would wait forever. Raft's own Grok launch runs with
+ * `--always-approve`, so autonomous is the matching behaviour.
+ */
+const AUTONOMY_MODE = process.env.AIDER_DESK_SHIM_AUTONOMY || 'autonomous';
+
+/** Comma-separated model allowlist (`provider/model` or a bare model id). */
+const MODEL_ALLOWLIST = (process.env.AIDER_DESK_SHIM_MODELS || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+const QUEUED_MESSAGE_PREFIX =
+    '[Sent while you were working — this is a follow-up to the current task, not a new task.]\n\n';
+
+const STANDING_PROMPT_UPDATE_PREFIX =
+    'Raft updated your standing instructions since this session started. The instructions below replace the earlier standing instructions (system or developer prompt) for the rest of this session; where they differ, follow these.\n\n';
 
 type JsonRpcId = number | string;
 
@@ -139,12 +160,23 @@ async function fetchModels(): Promise<{ id: string; label: string }[]> {
                 label: typeof entry.name === 'string' && entry.name ? entry.name : composed,
             });
         }
-        return models;
+        return filterModels(models);
     } catch {
         return [];
     } finally {
         clearTimeout(timer);
     }
+}
+
+function filterModels(models: { id: string; label: string }[]): { id: string; label: string }[] {
+    if (MODEL_ALLOWLIST.length === 0) {
+        return models;
+    }
+    return models.filter((model) =>
+        MODEL_ALLOWLIST.some(
+            (allowed) => model.id === allowed || model.id.endsWith(`/${allowed}`) || model.id.includes(allowed),
+        ),
+    );
 }
 
 /** Raft reads `_meta.modelState.{currentModelId,availableModels[].{modelId,name}}`. */
@@ -165,8 +197,11 @@ function buildModelState(models: { id: string; label: string }[]): Record<string
 /* ------------------------------------------------------------------ */
 
 type SessionState = {
+    /** Latest standing prompt Raft announced for this session. */
     standingPrompt?: string;
-    firstPromptSent: boolean;
+    standingHash?: string;
+    /** `initial` for a first delivery, `refresh` when a resume replaced it. */
+    standingPending?: 'initial' | 'refresh';
     busy: boolean;
     queue: QueuedDelivery[];
 };
@@ -199,6 +234,8 @@ async function runProxy(): Promise<void> {
     const pendingSession = new Map<JsonRpcId, { standing?: string; requestedSessionId?: string }>();
     const pendingPrompts = new Map<JsonRpcId, PendingPrompt>();
     const pendingConfig = new Map<JsonRpcId, JsonRpcId>();
+    /** Internal requests whose responses are ours to swallow (not the client's). */
+    const pendingSilent = new Set<JsonRpcId>();
     let internalCounter = 0;
 
     const modelStatePromise = fetchModels().then(buildModelState);
@@ -217,24 +254,44 @@ async function runProxy(): Promise<void> {
     function ensureSession(sessionId: string): SessionState {
         let session = sessions.get(sessionId);
         if (!session) {
-            session = { firstPromptSent: false, busy: false, queue: [] };
+            session = { busy: false, queue: [] };
             sessions.set(sessionId, session);
         }
         return session;
     }
 
+    /**
+     * Raft re-sends the standing prompt on every session/new and session/load.
+     * Only a changed prompt is queued for delivery, so a resume on the same
+     * prompt does not duplicate ~30 KB into the conversation.
+     */
+    function noteStandingPrompt(session: SessionState, prompt?: string): void {
+        if (!prompt) {
+            return;
+        }
+        const hash = createHash('sha256').update(prompt).digest('hex').slice(0, 16);
+        if (hash === session.standingHash) {
+            return;
+        }
+        session.standingPending = session.standingHash ? 'refresh' : 'initial';
+        session.standingPrompt = prompt;
+        session.standingHash = hash;
+    }
+
     function applyStandingPrompt(session: SessionState, message: JsonRpcMessage): JsonRpcMessage {
-        if (!session.standingPrompt || session.firstPromptSent) {
+        if (!session.standingPrompt || !session.standingPending) {
             return message;
         }
-        session.firstPromptSent = true;
+        const kind = session.standingPending;
+        session.standingPending = undefined;
+        const text = kind === 'refresh' ? `${STANDING_PROMPT_UPDATE_PREFIX}${session.standingPrompt}` : session.standingPrompt;
         const params = message.params ?? {};
         const prompt = Array.isArray(params.prompt) ? params.prompt : [];
         return {
             ...message,
             params: {
                 ...params,
-                prompt: [{ type: 'text', text: session.standingPrompt }, ...prompt],
+                prompt: [{ type: 'text', text }, ...prompt],
             },
         };
     }
@@ -248,7 +305,7 @@ async function runProxy(): Promise<void> {
             jsonrpc: '2.0',
             id,
             method: 'session/prompt',
-            params: { sessionId, prompt: [{ type: 'text', text }] },
+            params: { sessionId, prompt: [{ type: 'text', text: `${QUEUED_MESSAGE_PREFIX}${text}` }] },
         });
     }
 
@@ -380,6 +437,11 @@ async function runProxy(): Promise<void> {
             return;
         }
 
+        if (id !== undefined && pendingSilent.has(id)) {
+            pendingSilent.delete(id);
+            return;
+        }
+
         if (id !== undefined && pendingConfig.has(id)) {
             const clientId = pendingConfig.get(id)!;
             pendingConfig.delete(id);
@@ -409,13 +471,26 @@ async function runProxy(): Promise<void> {
                 (typeof result.sessionId === 'string' ? result.sessionId : undefined) ??
                 (typeof meta.sessionId === 'string' ? meta.sessionId : undefined) ??
                 pending.requestedSessionId;
+            const options = Array.isArray(result.configOptions) ? result.configOptions : [];
             if (sessionId) {
                 const session = ensureSession(sessionId);
-                if (pending.standing) {
-                    session.standingPrompt = pending.standing;
-                }
+                noteStandingPrompt(session, pending.standing);
             }
             writeClient(message);
+
+            // AiderDesk starts every session in `guided`; Raft has no approval
+            // surface, so align the session with the Grok driver's
+            // `--always-approve` launch instead of waiting on a plan prompt.
+            if (sessionId && AUTONOMY_MODE && options.some((option: any) => option?.id === 'autonomy_mode')) {
+                const internal = nextInternalId();
+                pendingSilent.add(internal);
+                writeChild({
+                    jsonrpc: '2.0',
+                    id: internal,
+                    method: 'session/set_config_option',
+                    params: { sessionId, configId: 'autonomy_mode', value: AUTONOMY_MODE },
+                });
+            }
             return;
         }
 

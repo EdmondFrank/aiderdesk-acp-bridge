@@ -39,6 +39,19 @@ raft-computer restart /<server-slug>   # slug = the part after /s/ in the URL
 
 ## Use in Raft
 
+Set these before starting Raft Computer if the defaults do not fit:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `AIDER_DESK_PORT` | `23456` | AiderDesk server port |
+| `AIDER_DESK_SHIM_MODELS` | all | Comma-separated allowlist; exact `provider/model`, a `/model` suffix, or a substring |
+| `AIDER_DESK_SHIM_AUTONOMY` | `autonomous` | Session `autonomy_mode` applied after `session/new` |
+
+`autonomous` is deliberate: Raft has no approval surface and the bridge never
+answers AiderDesk's `ask-question` events, so a `guided` session would wait on a
+plan approval nobody can see. The Grok launch Raft uses is
+`--always-approve`, so this matches it.
+
 1. Create an agent (`+` in the agents sidebar) and pick runtime **Grok Build**.
 2. The model list is AiderDesk's `GET /api/models`. `AiderDesk default` leaves
    the task/profile model untouched; picking a real entry persists
@@ -52,8 +65,8 @@ raft-computer restart /<server-slug>   # slug = the part after /s/ in the URL
 | --- | --- | --- |
 | expects models in `initialize` → `_meta.modelState` | injects `modelState` from `/api/models` | only returns `configOptions` on `session/new` |
 | `session/set_model` (private draft method) | rewritten | `session/set_config_option { configId: "model" }` |
-| `session/new._meta.systemPromptOverride` (standing prompt) | cached, prepended as a text block to the first prompt | ignores `_meta` |
-| `_x.ai/interject` / `session/steer` while a turn runs | acked immediately, queued, replayed as the next `session/prompt` | no mid-turn injection |
+| `session/new._meta.systemPromptOverride` (standing prompt) | hashed; a changed prompt is prepended to the next prompt (`initial`, or `refresh` with Raft's replacement wording) | ignores `_meta` |
+| `_x.ai/interject` / `session/steer` while a turn runs | acked immediately, queued, replayed as the next `session/prompt` with a "sent while you were working" prefix | no mid-turn injection |
 
 Everything else (`initialize`, `session/load`, `session/prompt`, `session/cancel`,
 `session/update` notifications, child→client requests) is passed through
