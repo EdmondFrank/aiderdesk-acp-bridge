@@ -115,6 +115,8 @@ export type AcpSessionUsage = {
 export type AcpSession = {
   cwd: string;
   taskId?: string;
+  /** Raft's standing prompt, delivered as per-run system instructions. */
+  additionalInstructions?: string;
   abortController?: AbortController;
   sseStream?: ReadableStream<Uint8Array>;
   mode: string;
@@ -127,6 +129,17 @@ export type AcpSession = {
   commands: CommandsData;
   usage: AcpSessionUsage;
 };
+
+/**
+ * Raft delivers its standing prompt in `_meta.systemPromptOverride`, which is
+ * not part of ACP v1. Pass it through as per-run system instructions so it is
+ * rendered into the system prompt instead of the conversation history.
+ */
+function extractAdditionalInstructions(params: unknown): string | undefined {
+  const meta = (params as { _meta?: Record<string, unknown> } | null | undefined)?._meta;
+  const value = meta?.systemPromptOverride;
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
 
 export class AcpAgent {
   private readonly sessions = new Map<string, AcpSession>();
@@ -164,6 +177,7 @@ export class AcpAgent {
 
   async newSession(params: acp.NewSessionRequest, cx: acp.AgentContext): Promise<acp.NewSessionResponse> {
     const cwd = params.cwd ?? '';
+    const additionalInstructions = extractAdditionalInstructions(params);
 
     // Create the backing AiderDesk task eagerly so the ACP session id can be
     // the server's persistent task id. That makes sessions show up in
@@ -179,6 +193,7 @@ export class AcpAgent {
     }
     const sessionId = taskId ?? generateSessionId();
     const session = await this.createSession(cwd, taskId);
+    session.additionalInstructions = additionalInstructions;
     this.sessions.set(sessionId, session);
 
     const configOptions = buildConfigOptions(
@@ -344,11 +359,15 @@ export class AcpAgent {
   async loadSession(params: acp.LoadSessionRequest, cx: acp.AgentContext): Promise<acp.LoadSessionResponse> {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
+    const additionalInstructions = extractAdditionalInstructions(params);
 
     let session = this.sessions.get(sessionId);
     if (!session) {
       session = await this.createSession(cwd, sessionId);
       this.sessions.set(sessionId, session);
+    }
+    if (additionalInstructions) {
+      session.additionalInstructions = additionalInstructions;
     }
 
     const state = await loadTask(this.host, this.port, session.cwd || cwd, sessionId);
@@ -377,11 +396,15 @@ export class AcpAgent {
   async resumeSession(params: acp.ResumeSessionRequest, cx: acp.AgentContext): Promise<acp.ResumeSessionResponse> {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
+    const additionalInstructions = extractAdditionalInstructions(params);
 
     let session = this.sessions.get(sessionId);
     if (!session) {
       session = await this.createSession(cwd, sessionId);
       this.sessions.set(sessionId, session);
+    }
+    if (additionalInstructions) {
+      session.additionalInstructions = additionalInstructions;
     }
 
     await resumeTask(this.host, this.port, session.cwd || cwd, sessionId);
@@ -502,6 +525,9 @@ export class AcpAgent {
       mode: session.mode,
       autonomyMode: options?.autonomyMode ?? session.autonomyMode,
     };
+    if (session.additionalInstructions) {
+      requestBody.additionalInstructions = session.additionalInstructions;
+    }
     if (session.taskId) {
       requestBody.taskId = session.taskId;
     }

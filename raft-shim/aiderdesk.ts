@@ -10,9 +10,10 @@
  * translates the handful of Grok-specific extensions Raft depends on:
  *
  *   initialize         -> inject `_meta.modelState` from AiderDesk /api/models
- *   session/new|load    -> remember `_meta.systemPromptOverride`
+ *   session/new|load    -> forward `_meta.systemPromptOverride` as system
+ *                          instructions (prepend to the prompt as a fallback)
  *   session/set_model   -> session/set_config_option { configId: "model" }
- *   session/prompt      -> prepend the standing prompt, serialise turns
+ *   session/prompt      -> serialise turns
  *   _x.ai/interject     -> queue, replay after the current turn
  *
  * The real ACP implementation stays in ../src (aiderdesk-acp-bridge); this
@@ -34,14 +35,24 @@ const DEFAULT_PORT = 23456;
  */
 const AUTONOMY_MODE = process.env.AIDER_DESK_SHIM_AUTONOMY || 'autonomous';
 
-/** Comma-separated model allowlist (`provider/model` or a bare model id). */
-const MODEL_ALLOWLIST = (process.env.AIDER_DESK_SHIM_MODELS || '')
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-
 const QUEUED_MESSAGE_PREFIX =
     '[Sent while you were working — this is a follow-up to the current task, not a new task.]\n\n';
+
+/**
+ * Appended to Raft's standing prompt when it becomes system-prompt text, so
+ * the agent knows the transport: no approval UI, no `raft` CLI, and replies are
+ * delivered automatically.
+ */
+const ACP_RUNTIME_NOTE = `\n\n## Runtime notes (Raft over ACP)
+
+You are reached through Raft's Agent Client Protocol connection, not the AiderDesk UI.
+
+- Text you write is streamed to the conversation as it is produced; never call a tool just to send a message.
+- There is no approval prompt and nobody can answer a mid-task question, so decide, act, and record assumptions in your reply.
+- The \`raft\` CLI is not on your PATH; use your own shell, file and search tools.
+`;
+
+const ACP_RUNTIME_NOTE_MARKER = '## Runtime notes (Raft over ACP)';
 
 const STANDING_PROMPT_UPDATE_PREFIX =
     'Raft updated your standing instructions since this session started. The instructions below replace the earlier standing instructions (system or developer prompt) for the rest of this session; where they differ, follow these.\n\n';
@@ -160,7 +171,7 @@ async function fetchModels(): Promise<{ id: string; label: string }[]> {
                 label: typeof entry.name === 'string' && entry.name ? entry.name : composed,
             });
         }
-        return filterModels(models);
+        return models;
     } catch {
         return [];
     } finally {
@@ -168,15 +179,29 @@ async function fetchModels(): Promise<{ id: string; label: string }[]> {
     }
 }
 
-function filterModels(models: { id: string; label: string }[]): { id: string; label: string }[] {
-    if (MODEL_ALLOWLIST.length === 0) {
-        return models;
+/** Capability that lets the bridge put extra text into the system prompt. */
+const INSTRUCTIONS_CAPABILITY = 'runPrompt.additionalInstructions';
+
+async function fetchCapabilities(): Promise<Set<string>> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+        const response = await fetch(`http://${serverHost()}:${serverPort()}/api/health`, {
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            return new Set();
+        }
+        const data = (await response.json()) as { capabilities?: unknown };
+        if (!Array.isArray(data.capabilities)) {
+            return new Set();
+        }
+        return new Set(data.capabilities.filter((entry): entry is string => typeof entry === 'string'));
+    } catch {
+        return new Set();
+    } finally {
+        clearTimeout(timer);
     }
-    return models.filter((model) =>
-        MODEL_ALLOWLIST.some(
-            (allowed) => model.id === allowed || model.id.endsWith(`/${allowed}`) || model.id.includes(allowed),
-        ),
-    );
 }
 
 /** Raft reads `_meta.modelState.{currentModelId,availableModels[].{modelId,name}}`. */
@@ -239,6 +264,28 @@ async function runProxy(): Promise<void> {
     let internalCounter = 0;
 
     const modelStatePromise = fetchModels().then(buildModelState);
+    const capabilitiesPromise = fetchCapabilities();
+    /**
+     * Whether the standing prompt can travel as system-prompt text. `undefined`
+     * until the first session/new resolves the probe; `false` keeps the old
+     * behaviour of prepending it to the first user message.
+     */
+    let viaSystemPrompt: boolean | undefined;
+
+    async function ensureCapabilities(): Promise<boolean> {
+        if (viaSystemPrompt === undefined) {
+            const capabilities = await capabilitiesPromise;
+            viaSystemPrompt = capabilities.has(INSTRUCTIONS_CAPABILITY);
+            if (DEBUG) {
+                process.stderr.write(`[shim] standing prompt via system instructions: ${viaSystemPrompt}\n`);
+            }
+        }
+        return viaSystemPrompt;
+    }
+
+    function withRuntimeNote(prompt: string): string {
+        return prompt.includes(ACP_RUNTIME_NOTE_MARKER) ? prompt : `${prompt}${ACP_RUNTIME_NOTE}`;
+    }
 
     function nextInternalId(): string {
         internalCounter += 1;
@@ -331,7 +378,7 @@ async function runProxy(): Promise<void> {
         }
     }
 
-    function handleClientMessage(message: JsonRpcMessage): void {
+    async function handleClientMessage(message: JsonRpcMessage): Promise<void> {
         const { id, method } = message;
 
         if (method === undefined) {
@@ -349,17 +396,32 @@ async function runProxy(): Promise<void> {
             case 'session/new':
             case 'session/load': {
                 const meta = (message.params?._meta ?? {}) as Record<string, unknown>;
+                const standing =
+                    typeof meta.systemPromptOverride === 'string' && meta.systemPromptOverride
+                        ? meta.systemPromptOverride
+                        : undefined;
+                let forwarded = message;
+                if (standing && (await ensureCapabilities())) {
+                    // The bridge keeps `_meta.systemPromptOverride` per session and
+                    // sends it as `additionalInstructions` on every turn, so the
+                    // prompt lands in the system prompt instead of the conversation.
+                    // A session/load after a prompt change replaces it in place.
+                    forwarded = {
+                        ...message,
+                        params: {
+                            ...message.params,
+                            _meta: { ...meta, systemPromptOverride: withRuntimeNote(standing) },
+                        },
+                    };
+                }
                 pendingSession.set(id!, {
-                    standing:
-                        typeof meta.systemPromptOverride === 'string' && meta.systemPromptOverride
-                            ? meta.systemPromptOverride
-                            : undefined,
+                    standing: viaSystemPrompt ? undefined : standing,
                     requestedSessionId:
                         method === 'session/load' && typeof message.params?.sessionId === 'string'
                             ? message.params.sessionId
                             : undefined,
                 });
-                writeChild(message);
+                writeChild(forwarded);
                 return;
             }
             case 'session/set_model': {
@@ -559,13 +621,13 @@ async function runProxy(): Promise<void> {
                 buffer = buffer.slice(newline + 1);
                 const parsed = parseLine(line);
                 if (parsed) {
-                    handleClientMessage(parsed);
+                    await handleClientMessage(parsed);
                 }
             }
         }
         const tail = parseLine(buffer);
         if (tail) {
-            handleClientMessage(tail);
+            await handleClientMessage(tail);
         }
     }
 

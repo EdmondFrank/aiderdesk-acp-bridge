@@ -44,7 +44,6 @@ Set these before starting Raft Computer if the defaults do not fit:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `AIDER_DESK_PORT` | `23456` | AiderDesk server port |
-| `AIDER_DESK_SHIM_MODELS` | all | Comma-separated allowlist; exact `provider/model`, a `/model` suffix, or a substring |
 | `AIDER_DESK_SHIM_AUTONOMY` | `autonomous` | Session `autonomy_mode` applied after `session/new` |
 
 `autonomous` is deliberate: Raft has no approval surface and the bridge never
@@ -53,11 +52,35 @@ plan approval nobody can see. The Grok launch Raft uses is
 `--always-approve`, so this matches it.
 
 1. Create an agent (`+` in the agents sidebar) and pick runtime **Grok Build**.
-2. The model list is AiderDesk's `GET /api/models`. `AiderDesk default` leaves
-   the task/profile model untouched; picking a real entry persists
-   `provider/model` onto the AiderDesk task.
+2. The model list is every entry from AiderDesk's `GET /api/models`, plus
+   `AiderDesk default`, which leaves the task/profile model untouched. Picking a
+   real entry persists `provider/model` onto the AiderDesk task.
 3. The AiderDesk server must be running (`AIDER_DESK_PORT`, default `23456`);
    the bridge exits immediately when `/api/health` is not `ok`.
+
+## Where the standing prompt goes
+
+Raft's standing prompt (~29 KB) arrives in `_meta.systemPromptOverride` on
+`session/new` and `session/load`. The shim picks one of two deliveries:
+
+* **Preferred — system prompt.** It probes `GET /api/health` once; when the
+  server advertises `runPrompt.additionalInstructions` in `capabilities`, the
+  shim appends a short ACP runtime note (no approval UI, no `raft` CLI, replies
+  are delivered automatically) and the bridge forwards the result as
+  `additionalInstructions`. `prompts-manager` appends that after
+  `customInstructions`, so Raft's prompt is part of the system prompt and never
+  enters the conversation as a user message.
+* **Fallback.** A server without the capability gets the old behaviour: the
+  prompt is prepended to the next `session/prompt`, hashed so an unchanged
+  resume does not repeat it. A changed prompt is labelled as replacing the
+  earlier instructions.
+
+The capability needs a server built from the matching source:
+
+```sh
+npx vite build --config vite.config.server.ts   # in the AiderDesk repo
+# then restart the AiderDesk server process
+```
 
 ## What it translates
 
@@ -65,7 +88,7 @@ plan approval nobody can see. The Grok launch Raft uses is
 | --- | --- | --- |
 | expects models in `initialize` → `_meta.modelState` | injects `modelState` from `/api/models` | only returns `configOptions` on `session/new` |
 | `session/set_model` (private draft method) | rewritten | `session/set_config_option { configId: "model" }` |
-| `session/new._meta.systemPromptOverride` (standing prompt) | hashed; a changed prompt is prepended to the next prompt (`initial`, or `refresh` with Raft's replacement wording) | ignores `_meta` |
+| `session/new._meta.systemPromptOverride` (standing prompt) | forwarded as `additionalInstructions` when `/api/health` advertises `runPrompt.additionalInstructions`; otherwise hashed and prepended to the next prompt (`initial`, or `refresh` with Raft's replacement wording) | `additionalInstructions` → system prompt |
 | `_x.ai/interject` / `session/steer` while a turn runs | acked immediately, queued, replayed as the next `session/prompt` with a "sent while you were working" prefix | no mid-turn injection |
 
 Everything else (`initialize`, `session/load`, `session/prompt`, `session/cancel`,
