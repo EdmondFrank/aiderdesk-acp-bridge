@@ -200,14 +200,18 @@ export type TaskSummary = {
 };
 
 /**
- * List the tasks for a project via `GET /api/project/tasks`.
- * Returns an empty list on any failure so callers degrade gracefully.
+ * Ask the server for a project's tasks.
+ *
+ * `undefined` means the request failed (network, timeout, non-200, garbage);
+ * an empty array means the server answered and there are no tasks. Callers that
+ * only render a list may conflate the two, but deciding that a *session* is
+ * gone must not: a transient failure would otherwise abandon a live task.
  */
-export async function listTasks(
+async function requestTaskList(
   host: string,
   port: number,
   projectDir: string,
-): Promise<TaskSummary[]> {
+): Promise<TaskSummary[] | undefined> {
   try {
     const response = await fetchJSON(
       host,
@@ -216,7 +220,7 @@ export async function listTasks(
       'GET',
     );
     if (response.status !== 200) {
-      return [];
+      return undefined;
     }
     const tasks = response.data as TaskSummary[];
     return Array.isArray(tasks)
@@ -228,10 +232,33 @@ export async function listTasks(
           ...(typeof t.archived === 'boolean' ? { archived: t.archived } : {}),
           ...(t.updatedAt ? { updatedAt: t.updatedAt } : {}),
         }))
-      : [];
+      : undefined;
   } catch {
-    return [];
+    return undefined;
   }
+}
+
+/**
+ * List the tasks for a project via `GET /api/project/tasks`.
+ * Returns an empty list on any failure so callers degrade gracefully.
+ */
+export async function listTasks(host: string, port: number, projectDir: string): Promise<TaskSummary[]> {
+  return (await requestTaskList(host, port, projectDir)) ?? [];
+}
+
+/**
+ * List tasks, failing when the request itself fails.
+ *
+ * Used before declaring a session missing: only a successful answer may be read
+ * as "this task does not exist". An unreachable server must surface as an error
+ * the client can retry, not as a session that has to be recreated from scratch.
+ */
+export async function listTasksStrict(host: string, port: number, projectDir: string): Promise<TaskSummary[]> {
+  const tasks = await requestTaskList(host, port, projectDir);
+  if (!tasks) {
+    throw new Error(`AiderDesk task list request failed for ${projectDir}`);
+  }
+  return tasks;
 }
 
 /** A stored conversation message, as returned by `POST /api/project/tasks/load`. */
@@ -255,7 +282,8 @@ export type TaskStateData = {
 
 /**
  * Load a task's full conversation state via `POST /api/project/tasks/load`.
- * Returns `undefined` on any failure so callers degrade gracefully.
+ * Returns `undefined` when the request fails. `tasks/load` answers an unknown id
+ * with 200 and no messages, so an existing-but-empty task is `{ messages: [] }`.
  */
 export async function loadTask(
   host: string,
@@ -275,13 +303,24 @@ export async function loadTask(
       return undefined;
     }
     const data = response.data as { messages?: unknown } | undefined;
-    if (!data || !Array.isArray(data.messages)) {
-      return undefined;
-    }
-    return { messages: data.messages as TaskStateMessage[] };
+    return { messages: Array.isArray(data?.messages) ? (data?.messages as TaskStateMessage[]) : [] };
   } catch {
     return undefined;
   }
+}
+
+/** Load a task, failing when the request itself fails (see `listTasksStrict`). */
+export async function loadTaskStrict(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+): Promise<TaskStateData> {
+  const state = await loadTask(host, port, projectDir, taskId);
+  if (!state) {
+    throw new Error(`AiderDesk task load request failed for ${taskId}`);
+  }
+  return state;
 }
 
 /** Ask the AiderDesk server to resume a task (`POST /api/project/resume-task`, best-effort). */
@@ -431,4 +470,46 @@ export async function handoffConversation(
   );
   const data = response.data as { taskId?: unknown } | undefined;
   return typeof data?.taskId === 'string' ? data.taskId : undefined;
+}
+
+/**
+ * Answer a pending question (`POST /api/project/answer-question`). The server
+ * blocks the turn on the question, so an ACP client with no approval surface
+ * must answer it or the turn waits for the SSE timeout.
+ */
+export async function answerQuestion(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  answer: string,
+): Promise<void> {
+  await fetchJSON(
+    host,
+    port,
+    '/api/project/answer-question',
+    'POST',
+    JSON.stringify({ projectDir, taskId, answer }),
+  );
+}
+
+/**
+ * Update arbitrary task fields (`POST /api/project/tasks` accepts a partial
+ * `TaskData`). Used to persist session config options that `run-prompt`
+ * ignores once a task id exists. Best-effort: failures are swallowed.
+ */
+export async function updateTaskFields(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  updates: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await fetchJSON(host, port, '/api/project/tasks', 'POST', JSON.stringify({ projectDir, id: taskId, updates }));
+  } catch (error) {
+    // Best-effort, but never silent: the server strips unknown fields, so a
+    // rejected request is the only signal that a config option did not persist.
+    process.stderr.write(`[http] failed to update task ${taskId} fields: ${String(error)}\n`);
+  }
 }

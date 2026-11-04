@@ -28,6 +28,11 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   session info, cancellation — including `agent_thought_chunk`, `agent_message_chunk`,
   `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications;
   `session/prompt` responses carry session-cumulative token usage (ACP experimental `usage`)
+- Standing prompts for clients that own the system prompt: `_meta.systemPromptOverride`
+  becomes `<project>/.aider-desk/rules/raft-standing-prompt.md`, so AiderDesk renders it
+  into the system prompt instead of the conversation history. Session-id → task-id
+  mappings are persisted (`AIDER_DESK_ACP_STATE_DIR`) because `/new` and `/handoff`
+  swap the task while the client keeps resuming by session id
 - Single-file compiled binary via `bun build --compile`
 
 ## Requirements
@@ -71,6 +76,10 @@ bun run build
 | `AIDER_DESK_PORT`              | AiderDesk server port (overridden by `--port`)                      | `23456`          |
 | `AIDER_DESK_JSON_TIMEOUT_MS`   | Timeout for plain JSON REST calls that never wait on the model      | `10000`          |
 | `AIDER_DESK_SSE_TIMEOUT_MS`    | Timeout for streaming turns (`session/prompt`) and for model-waiting calls (`/compact`, `/smart-compact`, `/handoff`) | `1800000` (30 min) |
+| `AIDER_DESK_ACP_AUTO_ANSWER`   | Answer AiderDesk questions on the client's behalf (`POST /api/project/answer-question`); enable for clients without an approval UI | `off` |
+| `AIDER_DESK_ACP_AUTO_ANSWER_MODE` | `once` submits one answer per question; `always` may pick the question's `a` (all / always) option, which the server then remembers for the rest of the task | `once` |
+| `AIDER_DESK_ACP_REPLAY`        | How much of a loaded task `session/load` replays: `full`, `tail` (last 20 messages) or `off` | `full` |
+| `AIDER_DESK_ACP_STATE_DIR`     | Directory holding the session-id → task-id map (survives bridge restarts) | `~/.local/state/aiderdesk-acp` |
 
 Timeouts are read once at startup and are expressed in milliseconds.
 `AIDER_DESK_SSE_TIMEOUT_MS` bounds the *whole* turn — it is not a connect-only
@@ -81,7 +90,22 @@ timeout, which is why that is the default here.
 ```sh
 # Allow unusually long turns (60 minutes) before the bridge aborts the stream
 AIDER_DESK_SSE_TIMEOUT_MS=3600000 aiderdesk-acp-bridge
+
+# Client owns the conversation: answer questions, do not replay the transcript
+AIDER_DESK_ACP_AUTO_ANSWER=1 AIDER_DESK_ACP_REPLAY=off aiderdesk-acp-bridge
 ```
+
+`AIDER_DESK_ACP_AUTO_ANSWER` matters because AiderDesk blocks the turn on
+`task.askQuestion()` — it has no timeout — so a question nobody answers only ends
+when the SSE deadline fires. The bridge answers with the question's default
+answer (or `y`) and reports the decision as an `agent_thought_chunk`.
+
+`AIDER_DESK_ACP_AUTO_ANSWER_MODE=once` (the default) never submits `a`/all,
+because the server stores that answer for the rest of the task — a single
+approval would silently become a standing one. Set it to `always` for an agent
+that should batch approvals. A question with no options needs free text, which
+this API cannot carry, so the bridge declines it (`n`) rather than answering a
+meaningless `y`; the turn ends either way.
 
 ### Typical client configuration
 
@@ -105,8 +129,8 @@ AIDER_DESK_SSE_TIMEOUT_MS=3600000 aiderdesk-acp-bridge
 | `session/new`                   | `POST /api/project/add-open`, `POST /api/project/tasks/new`, `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` — creates the backing task eagerly so the session id is a stable task id |
 | `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks`             |
 | `session/list_input_history`    | `GET /api/project/input-history` (custom extension method; used by agent-shell's input-history command) |
-| `session/load`                  | `POST /api/project/tasks/load` (replays the stored conversation as session updates) |
-| `session/resume`                | `POST /api/project/resume-task`                                    |
+| `session/load`                  | `POST /api/project/tasks/load` (replays the stored conversation as session updates, per `AIDER_DESK_ACP_REPLAY`; fails when the task no longer exists so the client can start fresh) |
+| `session/resume`                | `POST /api/project/resume-task` (fails when the task no longer exists, like `session/load`) |
 | `session/delete`                | `POST /api/project/tasks/delete`                                   |
 | `session/prompt`                | `POST /api/run-prompt` (SSE)                                       |
 | `session/cancel`                | aborts the SSE request + `POST /api/project/interrupt`             |

@@ -10,8 +10,9 @@
  * translates the handful of Grok-specific extensions Raft depends on:
  *
  *   initialize         -> inject `_meta.modelState` from AiderDesk /api/models
- *   session/new|load    -> forward `_meta.systemPromptOverride` as system
- *                          instructions (prepend to the prompt as a fallback)
+ *   session/new|load    -> forward `_meta.systemPromptOverride` (plus an ACP
+ *                          runtime note); the bridge stores it as a project
+ *                          rules file, so the server never changes
  *   session/set_model   -> session/set_config_option { configId: "model" }
  *   session/prompt      -> serialise turns
  *   _x.ai/interject     -> queue, replay after the current turn
@@ -20,7 +21,6 @@
  * file only proxies stdin/stdout and rewrites a few messages.
  */
 
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -53,9 +53,6 @@ You are reached through Raft's Agent Client Protocol connection, not the AiderDe
 `;
 
 const ACP_RUNTIME_NOTE_MARKER = '## Runtime notes (Raft over ACP)';
-
-const STANDING_PROMPT_UPDATE_PREFIX =
-    'Raft updated your standing instructions since this session started. The instructions below replace the earlier standing instructions (system or developer prompt) for the rest of this session; where they differ, follow these.\n\n';
 
 type JsonRpcId = number | string;
 
@@ -93,9 +90,12 @@ Raft looks this up under the name "grok" because its Grok Build driver is the
 only ACP-over-stdio runtime in the client; ~/.local/bin/grok is a symlink here.
 
 Environment:
-  AIDER_DESK_PORT            AiderDesk server port (default: ${DEFAULT_PORT})
-  AIDER_DESK_HOST            AiderDesk server host (default: localhost)
-  AIDER_DESK_SHIM_BRIDGE     Bridge entry to spawn (default: ../src/index.ts)
+  AIDER_DESK_PORT              AiderDesk server port (default: ${DEFAULT_PORT})
+  AIDER_DESK_HOST              AiderDesk server host (default: localhost)
+  AIDER_DESK_SHIM_BRIDGE       Bridge entry to spawn (default: ../src/index.ts)
+  AIDER_DESK_SHIM_AUTONOMY     autonomy_mode applied after session/new (default: autonomous)
+  AIDER_DESK_ACP_AUTO_ANSWER   Passed to the bridge (default: 1)
+  AIDER_DESK_ACP_REPLAY        Passed to the bridge: full | tail | off (default: off)
 `);
 }
 
@@ -145,6 +145,47 @@ function serverHost(): string {
     return process.env.AIDER_DESK_HOST || 'localhost';
 }
 
+/**
+ * ACP wraps a handler's thrown error as JSON-RPC `Internal error` and moves the
+ * original text into `data.details`, so the useful part is not in `message`.
+ */
+function errorText(error: Record<string, unknown> | undefined): string {
+    if (!error) {
+        return '';
+    }
+    const data = error.data as Record<string, unknown> | undefined;
+    if (data && typeof data.details === 'string' && data.details) {
+        return data.details;
+    }
+    return typeof error.message === 'string' ? error.message : '';
+}
+
+/**
+ * Raft's Grok driver only falls back to a fresh session (`resume_or_fresh`)
+ * when the `session/load` error reads as a missing session. The bridge throws
+ * `Session not found: …` for a task that no longer exists; without this rewrite
+ * Raft would surface an opaque "Internal error" and keep failing every turn.
+ */
+function isMissingSessionError(error: Record<string, unknown> | undefined): boolean {
+    return /\b(path|session)\b.*\b(not found|missing)\b/i.test(errorText(error));
+}
+
+/**
+ * Environment for the bridge child.
+ *
+ * Raft has no approval surface, so the bridge answers AiderDesk's questions
+ * itself instead of leaving the turn blocked on `task.askQuestion()`. Raft
+ * also replays its own transcript into a resumed session, so the bridge must
+ * not replay AiderDesk's as well — that would duplicate the whole history.
+ */
+function bridgeEnv(): Record<string, string | undefined> {
+    return {
+        ...process.env,
+        AIDER_DESK_ACP_AUTO_ANSWER: process.env.AIDER_DESK_ACP_AUTO_ANSWER ?? '1',
+        AIDER_DESK_ACP_REPLAY: process.env.AIDER_DESK_ACP_REPLAY ?? 'off',
+    };
+}
+
 async function fetchModels(): Promise<{ id: string; label: string }[]> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 4000);
@@ -179,31 +220,6 @@ async function fetchModels(): Promise<{ id: string; label: string }[]> {
     }
 }
 
-/** Capability that lets the bridge put extra text into the system prompt. */
-const INSTRUCTIONS_CAPABILITY = 'runPrompt.additionalInstructions';
-
-async function fetchCapabilities(): Promise<Set<string>> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    try {
-        const response = await fetch(`http://${serverHost()}:${serverPort()}/api/health`, {
-            signal: controller.signal,
-        });
-        if (!response.ok) {
-            return new Set();
-        }
-        const data = (await response.json()) as { capabilities?: unknown };
-        if (!Array.isArray(data.capabilities)) {
-            return new Set();
-        }
-        return new Set(data.capabilities.filter((entry): entry is string => typeof entry === 'string'));
-    } catch {
-        return new Set();
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 /** Raft reads `_meta.modelState.{currentModelId,availableModels[].{modelId,name}}`. */
 function buildModelState(models: { id: string; label: string }[]): Record<string, unknown> {
     // `default` keeps whatever model the AiderDesk task/profile already uses:
@@ -222,11 +238,6 @@ function buildModelState(models: { id: string; label: string }[]): Record<string
 /* ------------------------------------------------------------------ */
 
 type SessionState = {
-    /** Latest standing prompt Raft announced for this session. */
-    standingPrompt?: string;
-    standingHash?: string;
-    /** `initial` for a first delivery, `refresh` when a resume replaced it. */
-    standingPending?: 'initial' | 'refresh';
     busy: boolean;
     queue: QueuedDelivery[];
 };
@@ -250,13 +261,13 @@ async function runProxy(): Promise<void> {
         stdin: 'pipe',
         stdout: 'pipe',
         stderr: 'inherit',
-        env: process.env,
+        env: bridgeEnv(),
         cwd: process.cwd(),
     });
 
     const sessions = new Map<string, SessionState>();
     const pendingInit = new Set<JsonRpcId>();
-    const pendingSession = new Map<JsonRpcId, { standing?: string; requestedSessionId?: string }>();
+    const pendingSession = new Map<JsonRpcId, { requestedSessionId?: string }>();
     const pendingPrompts = new Map<JsonRpcId, PendingPrompt>();
     const pendingConfig = new Map<JsonRpcId, JsonRpcId>();
     /** Internal requests whose responses are ours to swallow (not the client's). */
@@ -264,24 +275,6 @@ async function runProxy(): Promise<void> {
     let internalCounter = 0;
 
     const modelStatePromise = fetchModels().then(buildModelState);
-    const capabilitiesPromise = fetchCapabilities();
-    /**
-     * Whether the standing prompt can travel as system-prompt text. `undefined`
-     * until the first session/new resolves the probe; `false` keeps the old
-     * behaviour of prepending it to the first user message.
-     */
-    let viaSystemPrompt: boolean | undefined;
-
-    async function ensureCapabilities(): Promise<boolean> {
-        if (viaSystemPrompt === undefined) {
-            const capabilities = await capabilitiesPromise;
-            viaSystemPrompt = capabilities.has(INSTRUCTIONS_CAPABILITY);
-            if (DEBUG) {
-                process.stderr.write(`[shim] standing prompt via system instructions: ${viaSystemPrompt}\n`);
-            }
-        }
-        return viaSystemPrompt;
-    }
 
     function withRuntimeNote(prompt: string): string {
         return prompt.includes(ACP_RUNTIME_NOTE_MARKER) ? prompt : `${prompt}${ACP_RUNTIME_NOTE}`;
@@ -305,42 +298,6 @@ async function runProxy(): Promise<void> {
             sessions.set(sessionId, session);
         }
         return session;
-    }
-
-    /**
-     * Raft re-sends the standing prompt on every session/new and session/load.
-     * Only a changed prompt is queued for delivery, so a resume on the same
-     * prompt does not duplicate ~30 KB into the conversation.
-     */
-    function noteStandingPrompt(session: SessionState, prompt?: string): void {
-        if (!prompt) {
-            return;
-        }
-        const hash = createHash('sha256').update(prompt).digest('hex').slice(0, 16);
-        if (hash === session.standingHash) {
-            return;
-        }
-        session.standingPending = session.standingHash ? 'refresh' : 'initial';
-        session.standingPrompt = prompt;
-        session.standingHash = hash;
-    }
-
-    function applyStandingPrompt(session: SessionState, message: JsonRpcMessage): JsonRpcMessage {
-        if (!session.standingPrompt || !session.standingPending) {
-            return message;
-        }
-        const kind = session.standingPending;
-        session.standingPending = undefined;
-        const text = kind === 'refresh' ? `${STANDING_PROMPT_UPDATE_PREFIX}${session.standingPrompt}` : session.standingPrompt;
-        const params = message.params ?? {};
-        const prompt = Array.isArray(params.prompt) ? params.prompt : [];
-        return {
-            ...message,
-            params: {
-                ...params,
-                prompt: [{ type: 'text', text }, ...prompt],
-            },
-        };
     }
 
     function sendPromptToChild(sessionId: string, text: string): void {
@@ -369,7 +326,7 @@ async function runProxy(): Promise<void> {
         if (next.request) {
             session.busy = true;
             pendingPrompts.set(next.request.id!, { sessionId, forward: true });
-            writeChild(applyStandingPrompt(session, next.request));
+            writeChild(next.request);
             return;
         }
         if (next.text !== undefined) {
@@ -400,22 +357,21 @@ async function runProxy(): Promise<void> {
                     typeof meta.systemPromptOverride === 'string' && meta.systemPromptOverride
                         ? meta.systemPromptOverride
                         : undefined;
-                let forwarded = message;
-                if (standing && (await ensureCapabilities())) {
-                    // The bridge keeps `_meta.systemPromptOverride` per session and
-                    // sends it as `additionalInstructions` on every turn, so the
-                    // prompt lands in the system prompt instead of the conversation.
-                    // A session/load after a prompt change replaces it in place.
-                    forwarded = {
-                        ...message,
-                        params: {
-                            ...message.params,
-                            _meta: { ...meta, systemPromptOverride: withRuntimeNote(standing) },
-                        },
-                    };
-                }
+                // The bridge writes the standing prompt to
+                // `<cwd>/.aider-desk/rules/raft-standing-prompt.md`, which
+                // AiderDesk renders into the system prompt. The write is
+                // idempotent, so re-sending it on every resume costs nothing
+                // and a changed prompt simply replaces the file.
+                const forwarded = standing
+                    ? {
+                          ...message,
+                          params: {
+                              ...message.params,
+                              _meta: { ...meta, systemPromptOverride: withRuntimeNote(standing) },
+                          },
+                      }
+                    : message;
                 pendingSession.set(id!, {
-                    standing: viaSystemPrompt ? undefined : standing,
                     requestedSessionId:
                         method === 'session/load' && typeof message.params?.sessionId === 'string'
                             ? message.params.sessionId
@@ -466,7 +422,7 @@ async function runProxy(): Promise<void> {
                 }
                 session.busy = true;
                 pendingPrompts.set(id!, { sessionId, forward: true });
-                writeChild(applyStandingPrompt(session, message));
+                writeChild(message);
                 return;
             }
             case 'session/cancel': {
@@ -535,10 +491,15 @@ async function runProxy(): Promise<void> {
                 pending.requestedSessionId;
             const options = Array.isArray(result.configOptions) ? result.configOptions : [];
             if (sessionId) {
-                const session = ensureSession(sessionId);
-                noteStandingPrompt(session, pending.standing);
+                ensureSession(sessionId);
             }
-            writeClient(message);
+            // A failed load of a task that is gone must read as "Session not
+            // found" for Raft (the details hide in `error.data.details`).
+            const forwarded =
+                message.error && pending.requestedSessionId && isMissingSessionError(message.error)
+                    ? { ...message, error: { ...message.error, message: errorText(message.error) } }
+                    : message;
+            writeClient(forwarded);
 
             // AiderDesk starts every session in `guided`; Raft has no approval
             // surface, so align the session with the Grok driver's

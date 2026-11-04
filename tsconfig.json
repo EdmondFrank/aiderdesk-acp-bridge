@@ -13,5 +13,6 @@
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src", "test", "raft-shim"]
+  "include": ["src", "test", "raft-shim"],
+  "exclude": ["raft-shim/raft-policy"]
 }

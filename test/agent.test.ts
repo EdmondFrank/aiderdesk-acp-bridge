@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import * as acp from '@agentclientprotocol/sdk';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { AcpAgent } from '../src/agent';
 import { selectById } from './helpers';
 
 const originalFetch = globalThis.fetch;
+
+// Session→task mappings must never touch the real user state directory.
+process.env.AIDER_DESK_ACP_STATE_DIR = mkdtempSync(join(tmpdir(), 'aiderdesk-acp-test-'));
 
 type FetchCall = { url: string; init?: RequestInit };
 
@@ -1095,6 +1101,9 @@ describe('AcpAgent', () => {
     router.add('GET', '/api/project/commands', () =>
       new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
     );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Loaded' }]), { status: 200 }),
+    );
     router.add('POST', '/api/project/tasks/load', () =>
       new Response(
         JSON.stringify({
@@ -1138,6 +1147,9 @@ describe('AcpAgent', () => {
     router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
     router.add('GET', '/api/project/commands', () =>
       new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Resumed' }]), { status: 200 }),
     );
     let seenBody: Record<string, unknown> | undefined;
     router.add('POST', '/api/project/resume-task', (call) => {
@@ -1283,5 +1295,445 @@ describe('AcpAgent', () => {
     expect(((thought.params as { update: { content: { text: string } } }).update.content.text)).toContain(
       "No task matching 'nope'",
     );
+  });
+  test('session/new writes the standing prompt as a project rules file', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let seenRunPrompt: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      seenRunPrompt = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const projectDir = mkdtempSync(join(tmpdir(), 'acp-standing-prompt-'));
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession(
+      {
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { systemPromptOverride: 'Always answer in Czech.' },
+      } as unknown as acp.NewSessionRequest,
+      cx,
+    );
+
+    const rulesPath = join(projectDir, '.aider-desk', 'rules', 'raft-standing-prompt.md');
+    const content = readFileSync(rulesPath, 'utf8');
+    expect(content.startsWith('<!-- managed by aiderdesk-acp-bridge')).toBe(true);
+    expect(content).toContain('Always answer in Czech.');
+
+    // The prompt lives in the system prompt now, so the turn carries only the
+    // user's own text.
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+    expect(seenRunPrompt?.prompt).toBe('hello');
+  });
+
+  test('session/load fails when the task no longer exists', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () => new Response('[]', { status: 200 }));
+    router.add('POST', '/api/project/tasks/load', () => new Response('{}', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+
+    await expect(agent.loadSession({ sessionId: 'gone', cwd: '/proj', mcpServers: [] }, cx)).rejects.toThrow(
+      /Session not found: gone/,
+    );
+  });
+
+  test('session/load replays only the tail when AIDER_DESK_ACP_REPLAY=tail', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      type: 'user',
+      id: `u${index}`,
+      content: `message ${index}`,
+    }));
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Loaded' }]), { status: 200 }),
+    );
+    router.add('POST', '/api/project/tasks/load', () => new Response(JSON.stringify({ messages }), { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_REPLAY = 'tail';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx, notifyCalls } = mockContext();
+      await agent.loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+
+      const replayed = notifyCalls.filter((c) => c.method === acp.methods.client.session.update);
+      expect(replayed).toHaveLength(20);
+    } finally {
+      delete process.env.AIDER_DESK_ACP_REPLAY;
+    }
+  });
+
+  test('prompt auto-answers a blocking question when enabled', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'ask-question',
+            data: {
+              baseDir: '/proj',
+              taskId: 'task-1',
+              text: 'Run the tests?',
+              answers: [
+                { text: '(Y)es', shortkey: 'y' },
+                { text: '(N)o', shortkey: 'n' },
+              ],
+            },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    let answerBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/answer-question', (call) => {
+      answerBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Answer submitted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_AUTO_ANSWER = '1';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx } = mockContext();
+      const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+
+      expect(answerBody).toEqual({ projectDir: '/proj', taskId: 'task-1', answer: 'y' });
+    } finally {
+      delete process.env.AIDER_DESK_ACP_AUTO_ANSWER;
+    }
+  });
+
+  test('prompt leaves questions unanswered unless auto-answer is enabled', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'ask-question',
+            data: { baseDir: '/proj', taskId: 'task-1', text: 'Run the tests?', answers: [] },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+
+    expect(router.callsMatching(/\/api\/project\/answer-question/)).toHaveLength(0);
+  });
+
+  test('a session without a standing prompt keeps another session rules file', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let created = 0;
+    router.add('POST', '/api/project/tasks/new', () =>
+      new Response(JSON.stringify({ id: `task-${++created}` }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const projectDir = mkdtempSync(join(tmpdir(), 'acp-shared-rules-'));
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    await agent.newSession(
+      {
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { systemPromptOverride: 'Rule from client A' },
+      } as unknown as acp.NewSessionRequest,
+      cx,
+    );
+    const rulesPath = join(projectDir, '.aider-desk', 'rules', 'raft-standing-prompt.md');
+    expect(readFileSync(rulesPath, 'utf8')).toContain('Rule from client A');
+
+    await agent.newSession({ cwd: projectDir, mcpServers: [] }, cx);
+
+    expect(readFileSync(rulesPath, 'utf8')).toContain('Rule from client A');
+  });
+
+  test('session/load reports a failed task list as an error, not a missing session', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () => new Response('boom', { status: 500 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+
+    const error = (await agent
+      .loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx)
+      .catch((caught: unknown) => caught)) as Error;
+    expect(error.message).toMatch(/task list request failed/);
+    // A server hiccup must not read as "start a fresh session".
+    expect(error.message).not.toMatch(/Session not found/);
+  });
+
+  test('session/resume fails when the task no longer exists', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () => new Response('[]', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+
+    await expect(agent.resumeSession({ sessionId: 'gone', cwd: '/proj', mcpServers: [] }, cx)).rejects.toThrow(
+      /Session not found: gone/,
+    );
+  });
+
+  test('the standing-prompt fallback echoes only the user text', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let seenRunPrompt: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      seenRunPrompt = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(
+        sseBody([
+          { type: 'user-message', data: { messageId: 'm-1' } },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      );
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    // A regular file where the project directory should be makes the rules file
+    // impossible to create, forcing the documented fallback.
+    const root = mkdtempSync(join(tmpdir(), 'acp-no-rules-'));
+    const projectDir = join(root, 'not-a-directory');
+    writeFileSync(projectDir, 'x');
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession(
+      {
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { systemPromptOverride: 'SECRET STANDING PROMPT' },
+      } as unknown as acp.NewSessionRequest,
+      cx,
+    );
+
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+
+    // The prompt still reaches the model ...
+    expect(String(seenRunPrompt?.prompt)).toContain('SECRET STANDING PROMPT');
+    // ... but the client is not told the user said it.
+    const echoes = notifyCalls.filter(
+      (call) => (call.params as { update?: { sessionUpdate?: string } })?.update?.sessionUpdate === 'user_message_chunk',
+    );
+    expect(echoes).toHaveLength(1);
+    expect((echoes[0].params as { update: { content: { text: string } } }).update.content.text).toBe('hello');
+  });
+
+  test('auto-answer submits one answer and never "a" by default', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'ask-question',
+            data: {
+              baseDir: '/proj',
+              taskId: 'task-1',
+              text: 'Add file from prompt to context?',
+              defaultAnswer: 'y',
+              answers: [
+                { text: '(Y)es', shortkey: 'y' },
+                { text: '(N)o', shortkey: 'n' },
+                { text: '(A)ll', shortkey: 'a' },
+              ],
+            },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    let answerBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/answer-question', (call) => {
+      answerBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Answer submitted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_AUTO_ANSWER = '1';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx } = mockContext();
+      const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+
+      // `a` would be remembered for the rest of the task; a single `y` is not.
+      expect(answerBody).toEqual({ projectDir: '/proj', taskId: 'task-1', answer: 'y' });
+    } finally {
+      delete process.env.AIDER_DESK_ACP_AUTO_ANSWER;
+    }
+  });
+
+  test('auto-answer picks "a" only in always mode', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'ask-question',
+            data: {
+              baseDir: '/proj',
+              taskId: 'task-1',
+              text: 'Add every detected file?',
+              defaultAnswer: 'y',
+              answers: [
+                { text: '(Y)es', shortkey: 'y' },
+                { text: '(A)ll', shortkey: 'a' },
+              ],
+            },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    let answerBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/answer-question', (call) => {
+      answerBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Answer submitted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_AUTO_ANSWER = '1';
+    process.env.AIDER_DESK_ACP_AUTO_ANSWER_MODE = 'always';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx } = mockContext();
+      const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+
+      expect(answerBody).toEqual({ projectDir: '/proj', taskId: 'task-1', answer: 'a' });
+    } finally {
+      delete process.env.AIDER_DESK_ACP_AUTO_ANSWER;
+      delete process.env.AIDER_DESK_ACP_AUTO_ANSWER_MODE;
+    }
+  });
+
+  test('auto-answer declines a free-text question instead of saying "y"', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'ask-question',
+            data: { baseDir: '/proj', taskId: 'task-1', text: 'Which environment?', answers: [] },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    let answerBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/project/answer-question', (call) => {
+      answerBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: 'Answer submitted' }), { status: 200 });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_AUTO_ANSWER = '1';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx, notifyCalls } = mockContext();
+      const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'go' }] }, cx);
+
+      expect(answerBody).toEqual({ projectDir: '/proj', taskId: 'task-1', answer: 'n' });
+      const thoughts = notifyCalls
+        .map((call) => (call.params as { update?: { sessionUpdate?: string; content?: { text?: string } } })?.update)
+        .filter((update) => update?.sessionUpdate === 'agent_thought_chunk')
+        .map((update) => update?.content?.text ?? '');
+      expect(thoughts.some((text) => text.includes('declined'))).toBe(true);
+    } finally {
+      delete process.env.AIDER_DESK_ACP_AUTO_ANSWER;
+    }
   });
 });

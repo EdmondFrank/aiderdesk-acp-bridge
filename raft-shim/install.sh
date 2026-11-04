@@ -4,10 +4,15 @@
 # Raft's Grok Build driver looks the runtime up as `grok` (hardcoded), so this
 # installs ~/.local/bin/aiderdesk and a `grok` symlink pointing at it. Set
 # BIN_DIR to install somewhere else.
+#
+# It also installs the `raft-policy` AiderDesk extension (stale tool-result
+# elision). Set SKIP_EXTENSION=1 to leave ~/.aider-desk/extensions alone, and
+# AIDER_DESK_EXTENSIONS_DIR to install it elsewhere.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+EXTENSIONS_DIR="${AIDER_DESK_EXTENSIONS_DIR:-$HOME/.aider-desk/extensions}"
 
 if ! command -v bun >/dev/null 2>&1; then
     echo "install.sh: bun is required (https://bun.sh)" >&2
@@ -26,4 +31,12 @@ ln -sfn aiderdesk "$BIN_DIR/grok"
 
 printf 'installed %s\n' "$BIN_DIR/aiderdesk"
 printf 'installed %s -> aiderdesk\n' "$BIN_DIR/grok"
+
+if [ "${SKIP_EXTENSION:-0}" != "1" ]; then
+    mkdir -p "$EXTENSIONS_DIR/raft-policy"
+    cp "$HERE/raft-policy/"*.ts "$EXTENSIONS_DIR/raft-policy/"
+    printf 'installed %s\n' "$EXTENSIONS_DIR/raft-policy"
+    printf 'a running AiderDesk server watches that directory and loads it automatically\n'
+fi
+
 printf 'restart Raft Computer if the runtime still shows as not installed: raft-computer restart /<server-slug>\n'

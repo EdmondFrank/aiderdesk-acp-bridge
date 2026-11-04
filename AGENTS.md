@@ -33,7 +33,7 @@ changes.
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 142 tests across 6 files
+bun test            # bun:test suite — 180 tests across 9 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -47,13 +47,15 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 | File | Responsibility |
 | --- | --- |
 | `src/index.ts` | CLI entry: arg parsing (`-p/--port`, `--host`, `-v`, `-h`, `AIDER_DESK_PORT` env), health check against `/api/health`, wraps `process.stdout` in a web `WritableStream` (Bun's `stdout.stream()` lacks `getWriter`), wires ACP methods and notifications to an `AcpAgent` over NDJSON stdio (including `session/list`, `session/load`, `session/resume`, `session/delete`). |
-| `src/agent.ts` | `AcpAgent` class — the ACP lifecycle and session state (`Map<sessionId, AcpSession>`). Sessions map 1:1 to AiderDesk tasks: `newSession` eagerly creates the task (`add-open` + `tasks/new`) and uses the task id as the session id (falling back to a local id when creation fails). `listSessions`/`loadSession`/`resumeSession`/`deleteSession` implement ACP session management over the task API; `replayTaskMessages` streams a loaded conversation as session updates. `prompt()` is the dispatcher: built-in command → direct REST; file-based custom command → local template expansion + SSE prompt flow; extension command → server-side `custom-commands` (best effort); anything else → regular `POST /api/run-prompt` SSE flow. `relaySse()` translates SSE events into ACP notifications. `setConfigOption` also handles the `model` config id (composed `provider/model` value) and persists it via `updateTaskModel` when a task exists. |
+| `src/agent.ts` | `AcpAgent` class — the ACP lifecycle and session state (`Map<sessionId, AcpSession>`). Sessions map 1:1 to AiderDesk tasks: `newSession` eagerly creates the task (`add-open` + `tasks/new`) and uses the task id as the session id (falling back to a local id when creation fails). `listSessions`/`loadSession`/`resumeSession`/`deleteSession` implement ACP session management over the task API; `replayTaskMessages` streams a loaded conversation as session updates. `prompt()` is the dispatcher: built-in command → direct REST; file-based custom command → local template expansion + SSE prompt flow; extension command → server-side `custom-commands` (best effort); anything else → regular `POST /api/run-prompt` SSE flow. `relaySse()` translates SSE events into ACP notifications. `setConfigOption` also handles the `model` config id (composed `provider/model` value) and persists it via `updateTaskModel` when a task exists, and persists `agent_profile`/`autonomy_mode` via `updateTaskFields` (the server ignores both on `run-prompt` once a task exists). `applyStandingPrompt` turns `_meta.systemPromptOverride` into a project rules file, `answerPendingQuestion` answers `ask-question` SSE events when `AIDER_DESK_ACP_AUTO_ANSWER` is set, and `replayMode` (`AIDER_DESK_ACP_REPLAY`) controls how much of a loaded task is replayed. |
 | `src/commands.ts` | Slash-command support: `fetchCommands` (`GET /api/project/commands`), command normalization/lookup, `BUILT_IN_COMMANDS` (`/new`, `/compact`, `/smart-compact`, `/handoff` + alias `/hand-off`, `/tasks`, `/load`), `parseCommandText`, argument substitution (`{{1}}`, `{{2}}`, `{{ARGUMENTS}}`), `!shell` line execution, template expansion. |
-| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers. |
+| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `listTasksStrict`, `loadTaskStrict`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `updateTaskFields`, `answerQuestion`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers; the `…Strict` variants distinguish "request failed" from "empty/missing", which is what `session/load` needs. |
+| `src/session-policy.ts` | Per-project session state that must outlive the process: `writeStandingPrompt`/`clearStandingPrompt` (the ACP standing prompt as `<project>/.aider-desk/rules/raft-standing-prompt.md`, which AiderDesk renders into the system prompt) and the session-id → task-id map (`rememberSessionTask`, `resolveSessionTask`, `forgetSessionTask`) persisted under `$AIDER_DESK_ACP_STATE_DIR` (default `~/.local/state/aiderdesk-acp`). |
 | `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project default profile/provider models (`fetchProviderModels`, `GET /api/models`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
 | `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle`, `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
 | `src/constants.ts` | Host/port defaults, env port resolution, built-in modes, `AIDER_MODES`, autonomy modes, default mode/autonomy. |
+| `raft-shim/` | Raft adapter: `aiderdesk.ts` proxies Raft's Grok ACP driver onto the bridge, `raft-policy/` holds an AiderDesk extension that elides stale tool results for long-lived agent tasks (own `tsconfig.json`, excluded from the bridge typecheck). |
 | `test/*.test.ts` | `bun:test` suites. `test/helpers.ts` exports `selectById` for asserting on config options. |
 
 ## Prompt dispatch order (in `AcpAgent.prompt`)
@@ -149,10 +151,56 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   `AIDER_DESK_SSE_TIMEOUT_MS` for long-running agents; the AiderDesk server itself
   allows 30 minutes per provider response (`src/main/network-manager.ts`).
 
+## Standing prompts, questions and replay (ACP clients without a UI)
+
+An ACP client that owns the conversation (Raft, agent-shell) delivers its own
+instructions and has no approval surface, which drives three behaviors:
+
+- **Standing prompt → project rules file.** `_meta.systemPromptOverride` is
+  written to `<project>/.aider-desk/rules/raft-standing-prompt.md`. AiderDesk
+  injects `.aider-desk/rules/*.md` into the system prompt (`<Knowledge><Rules>`),
+  so the text survives compaction and never sits in the conversation history.
+  The write is idempotent and atomic; if it fails, `pendingStandingPrompt`
+  prepends the text to the next prompt once (the `user_message_chunk` echo still
+  carries only what the user typed). The marker records the owning session as
+  `<pid>:<session id>`, and `clearStandingPrompt` only deletes a file no live
+  session owns — a second bridge process on the same directory keeps its rules.
+- **Questions must be answered.** AiderDesk blocks the turn on
+  `task.askQuestion()` — there is no timeout — so an unanswered `ask-question`
+  SSE event only ends when `AIDER_DESK_SSE_TIMEOUT_MS` fires. With
+  `AIDER_DESK_ACP_AUTO_ANSWER` enabled the bridge answers through
+  `POST /api/project/answer-question` (the question's default answer, then `y`;
+  `AIDER_DESK_ACP_AUTO_ANSWER_MODE=always` additionally allows `a`/all, which the
+  server remembers for the whole task), and reports the decision as an
+  `agent_thought_chunk`. A question with no options needs free text, so it is
+  declined with `n` instead of a meaningless `y`.
+- **Do not replay a transcript the client already has.** `AIDER_DESK_ACP_REPLAY`
+  is `full` (default, UI clients restoring a conversation), `tail` (last 20
+  messages) or `off`. Raft's shim sets `off` because Raft replays its own
+  transcript into the resumed session.
+
+`session/load` and `session/resume` **throw** when the task no longer exists
+(`Session not found: <session> (no AiderDesk task ...)`). ACP clients that own
+recovery (Raft's Grok driver) pattern-match that into "start a fresh session";
+returning an empty conversation instead would leave every later turn bound to a
+ghost task. Existence is checked with `listTasksStrict`, not `loadTask`:
+`POST /api/project/tasks/load` answers `{ messages: [] }` with status 200 for an
+unknown id, so it cannot distinguish "missing" from "empty". The strict variant
+matters as much as the check itself: a failed list request must surface as an
+error the client can retry, never as "missing" — that would abandon a live
+conversation on a transient server hiccup.
+
+The session id → task id mapping matters because `/new` and `/handoff` swap the
+underlying task while the ACP client keeps resuming by session id.
+
 ## Testing
 
 - `bun test`. Suites live next to behavior: `agent.test.ts`, `commands.test.ts`,
-  `http.test.ts`, `modes.test.ts`, `sse.test.ts`, `tools.test.ts`.
+  `http.test.ts`, `modes.test.ts`, `sse.test.ts`, `tools.test.ts`,
+  `session-policy.test.ts`, `raft-policy.test.ts`.
+- `agent.test.ts` points `AIDER_DESK_ACP_STATE_DIR` at a temp directory at import
+  time, so session mappings never touch the real user state file. Keep that line
+  when reordering imports.
 - The agent tests use a `createMockRouter()` fetch mock (`routes` + recorded `calls`,
   assert with `callsMatching(regexp)`) and `mockContext()` for `cx.notify` capture.
   The router falls back to default `add-open` / `tasks/new` responses (task id

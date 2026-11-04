@@ -11,7 +11,9 @@ import {
   fetchTask,
   handoffConversation,
   listTasks,
+  listTasksStrict,
   loadTask,
+  loadTaskStrict,
   requestSSEStream,
   resumeTask,
   runCustomCommand,
@@ -312,6 +314,23 @@ describe('listTasks', () => {
   });
 });
 
+describe('listTasksStrict', () => {
+  test('returns the tasks when the server answers', async () => {
+    installFetchMock(async () => new Response(JSON.stringify([{ id: 'task-1', baseDir: '/proj', name: 'Fix' }]), { status: 200 }));
+    expect(await listTasksStrict('localhost', 24337, '/proj')).toEqual([{ id: 'task-1', baseDir: '/proj', name: 'Fix' }]);
+  });
+
+  test('throws instead of looking like an empty project', async () => {
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    await expect(listTasksStrict('localhost', 24337, '/proj')).rejects.toThrow(/task list request failed/);
+
+    installFetchMock(async () => {
+      throw new Error('connection refused');
+    });
+    await expect(listTasksStrict('localhost', 24337, '/proj')).rejects.toThrow(/task list request failed/);
+  });
+});
+
 describe('fetchInputHistory', () => {
   test('GETs the input-history endpoint with projectDir and returns entries', async () => {
     let seenUrl = '';
@@ -369,8 +388,16 @@ describe('loadTask', () => {
     });
     expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
 
+    // An unknown id answers 200 with no messages: an existing-but-empty task.
     installFetchMock(async () => new Response(JSON.stringify({}), { status: 200 }));
-    expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toBeUndefined();
+    expect(await loadTask('localhost', 24337, '/proj', 'task-1')).toEqual({ messages: [] });
+  });
+});
+
+describe('loadTaskStrict', () => {
+  test('throws when the request fails instead of reporting an empty task', async () => {
+    installFetchMock(async () => new Response('nope', { status: 500 }));
+    await expect(loadTaskStrict('localhost', 24337, '/proj', 'task-1')).rejects.toThrow(/task load request failed/);
   });
 });
 

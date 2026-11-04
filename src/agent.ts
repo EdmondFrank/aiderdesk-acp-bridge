@@ -15,6 +15,7 @@ import {
 } from './commands';
 import { DEFAULT_AUTONOMY_MODE, DEFAULT_MODE, type ModeOption } from './constants';
 import {
+  answerQuestion,
   callInterrupt,
   compactConversation,
   createTask,
@@ -24,11 +25,13 @@ import {
   fetchTask,
   handoffConversation,
   listTasks,
-  loadTask,
+  listTasksStrict,
+  loadTaskStrict,
   requestSSEStream,
   resumeTask,
   runCustomCommand,
   smartCompactConversation,
+  updateTaskFields,
   updateTaskModel,
   type TaskStateMessage,
   type TaskSummary,
@@ -47,6 +50,13 @@ import {
   type AgentProfileInfo,
   type ModelInfo,
 } from './modes';
+import {
+  clearStandingPrompt,
+  forgetSessionTask,
+  rememberSessionTask,
+  resolveSessionTask,
+  writeStandingPrompt,
+} from './session-policy';
 import { parseSSEEvents } from './sse';
 import {
   buildToolCallContentArray,
@@ -78,6 +88,9 @@ type EventData = {
   level?: string;
   message?: string;
   question?: string;
+  text?: string;
+  answers?: Array<{ text?: string; shortkey?: string }>;
+  defaultAnswer?: string;
   name?: string;
   state?: string;
   provider?: string;
@@ -115,8 +128,13 @@ export type AcpSessionUsage = {
 export type AcpSession = {
   cwd: string;
   taskId?: string;
-  /** Raft's standing prompt, delivered as per-run system instructions. */
-  additionalInstructions?: string;
+  /** Standing prompt currently in force for this session, if any. */
+  standingPrompt?: string;
+  /**
+   * Standing prompt that could not be written as a project rules file (see
+   * `session-policy.ts`). Prepended to the next prompt once, then cleared.
+   */
+  pendingStandingPrompt?: string;
   abortController?: AbortController;
   sseStream?: ReadableStream<Uint8Array>;
   mode: string;
@@ -132,14 +150,80 @@ export type AcpSession = {
 
 /**
  * Raft delivers its standing prompt in `_meta.systemPromptOverride`, which is
- * not part of ACP v1. Pass it through as per-run system instructions so it is
- * rendered into the system prompt instead of the conversation history.
+ * not part of ACP v1. The bridge turns it into project rules text so AiderDesk
+ * renders it into the system prompt instead of the conversation history.
  */
-function extractAdditionalInstructions(params: unknown): string | undefined {
+function extractStandingPrompt(params: unknown): string | undefined {
   const meta = (params as { _meta?: Record<string, unknown> } | null | undefined)?._meta;
   const value = meta?.systemPromptOverride;
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
+
+/**
+ * Whether the bridge answers AiderDesk questions on the client's behalf.
+ * Opt-in: a client with a real approval UI answers them itself. The Raft shim
+ * enables it when it spawns the bridge, because Raft has no approval surface
+ * and an unanswered question blocks the turn until the stream times out.
+ */
+function autoAnswersQuestions(): boolean {
+  const raw = (process.env.AIDER_DESK_ACP_AUTO_ANSWER ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes';
+}
+
+/**
+ * How eagerly the bridge answers: `once` submits a single answer per question,
+ * `always` may pick the question's `a` (all / always) option, which the server
+ * then remembers for the rest of the task (`AIDER_DESK_ACP_AUTO_ANSWER_MODE`).
+ */
+function answerMode(): 'once' | 'always' {
+  const raw = (process.env.AIDER_DESK_ACP_AUTO_ANSWER_MODE ?? '').trim().toLowerCase();
+  return raw === 'always' ? 'always' : 'once';
+}
+
+/**
+ * Pick the answer the bridge submits for a question, or `undefined` when the
+ * question has no options and therefore needs a human (free text).
+ *
+ * `a` (all / always) is only chosen in `always` mode: the server stores it for
+ * the whole task, so a one-shot answer must not silently become a permanent yes.
+ */
+function chooseQuestionAnswer(data: EventData, mode: 'once' | 'always'): string | undefined {
+  const options = (data.answers ?? []).filter(
+    (option): option is { shortkey: string } =>
+      typeof option?.shortkey === 'string' && option.shortkey.length > 0,
+  );
+  if (options.length === 0) {
+    return undefined;
+  }
+
+  const candidates = [mode === 'always' ? 'a' : undefined, data.defaultAnswer, 'y'].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0,
+  );
+  for (const candidate of candidates) {
+    if (mode !== 'always' && candidate.toLowerCase() === 'a') {
+      continue;
+    }
+    const match = options.find((option) => option.shortkey.toLowerCase() === candidate.toLowerCase());
+    if (match) {
+      return match.shortkey;
+    }
+  }
+
+  const fallback =
+    mode === 'always'
+      ? options[0]
+      : (options.find((option) => option.shortkey.toLowerCase() !== 'a') ?? options[0]);
+  return fallback.shortkey;
+}
+
+/** How much stored conversation `session/load` replays (`AIDER_DESK_ACP_REPLAY`). */
+function replayMode(): 'full' | 'tail' | 'off' {
+  const raw = (process.env.AIDER_DESK_ACP_REPLAY ?? 'full').trim().toLowerCase();
+  return raw === 'tail' || raw === 'off' ? raw : 'full';
+}
+
+/** Number of trailing messages replayed in `tail` mode. */
+const REPLAY_TAIL_MESSAGES = 20;
 
 export class AcpAgent {
   private readonly sessions = new Map<string, AcpSession>();
@@ -177,7 +261,7 @@ export class AcpAgent {
 
   async newSession(params: acp.NewSessionRequest, cx: acp.AgentContext): Promise<acp.NewSessionResponse> {
     const cwd = params.cwd ?? '';
-    const additionalInstructions = extractAdditionalInstructions(params);
+    const standingPrompt = extractStandingPrompt(params);
 
     // Create the backing AiderDesk task eagerly so the ACP session id can be
     // the server's persistent task id. That makes sessions show up in
@@ -193,8 +277,11 @@ export class AcpAgent {
     }
     const sessionId = taskId ?? generateSessionId();
     const session = await this.createSession(cwd, taskId);
-    session.additionalInstructions = additionalInstructions;
     this.sessions.set(sessionId, session);
+    await this.applyStandingPrompt(session, sessionId, standingPrompt);
+    if (taskId) {
+      await rememberSessionTask(sessionId, taskId, cwd);
+    }
 
     const configOptions = buildConfigOptions(
       session.allModes,
@@ -228,6 +315,40 @@ export class AcpAgent {
       configOptions,
       modes: buildModeState(session.allModes, session.mode),
     };
+  }
+
+  /**
+   * Deliver a standing prompt for a session. Preferred: write it as a project
+   * rules file, so it becomes system-prompt text and survives compaction.
+   * Fallback: keep it on the session and prepend it to the next prompt.
+   *
+   * A call without a prompt is not "clear it": clients resume without
+   * re-sending their standing prompt, and the session keeps the one it already
+   * has. A rules file is only removed when this session never had a prompt, no
+   * other session in the same directory has one, and the file is not owned by
+   * another live bridge process (the owner is recorded in the marker).
+   */
+  private async applyStandingPrompt(session: AcpSession, sessionId: string, prompt?: string): Promise<void> {
+    const trimmed = prompt?.trim();
+
+    if (trimmed) {
+      session.standingPrompt = trimmed;
+      const written = await writeStandingPrompt(session.cwd, trimmed, sessionId);
+      session.pendingStandingPrompt = written ? undefined : trimmed;
+      return;
+    }
+
+    if (session.standingPrompt) {
+      return;
+    }
+
+    session.pendingStandingPrompt = undefined;
+    for (const other of this.sessions.values()) {
+      if (other !== session && other.cwd === session.cwd && other.standingPrompt) {
+        return;
+      }
+    }
+    await clearStandingPrompt(session.cwd, sessionId);
   }
 
   /**
@@ -276,9 +397,17 @@ export class AcpAgent {
       case 'agent_profile':
         session.agentProfileId = value;
         this.lastAgentProfileId = value;
+        // `run-prompt` ignores these options once a task exists, so they only
+        // take effect when they are persisted on the task itself.
+        if (session.taskId) {
+          await updateTaskFields(this.host, this.port, session.cwd, session.taskId, { agentProfileId: value });
+        }
         break;
       case 'autonomy_mode':
         session.autonomyMode = value;
+        if (session.taskId) {
+          await updateTaskFields(this.host, this.port, session.cwd, session.taskId, { autonomyMode: value });
+        }
         break;
       case 'model': {
         session.model = value;
@@ -359,21 +488,42 @@ export class AcpAgent {
   async loadSession(params: acp.LoadSessionRequest, cx: acp.AgentContext): Promise<acp.LoadSessionResponse> {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
-    const additionalInstructions = extractAdditionalInstructions(params);
+    const standingPrompt = extractStandingPrompt(params);
 
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = await this.createSession(cwd, sessionId);
+      const mappedTaskId = (await resolveSessionTask(sessionId)) ?? sessionId;
+      session = await this.createSession(cwd, mappedTaskId);
       this.sessions.set(sessionId, session);
     }
-    if (additionalInstructions) {
-      session.additionalInstructions = additionalInstructions;
+    await this.applyStandingPrompt(session, sessionId, standingPrompt);
+
+    const projectDir = session.cwd || cwd;
+    const taskId = session.taskId ?? sessionId;
+
+    // A task that no longer exists must fail loudly. Raft's Grok driver turns a
+    // `session ... not found` error into a fresh session (`resume_or_fresh`);
+    // reporting success would leave every later turn talking to a ghost task.
+    // `tasks/load` answers with an empty task for an unknown id, so existence
+    // has to come from the task list — and only a *successful* answer may be
+    // read as "missing", or a server hiccup would abandon a live conversation.
+    await ensureProjectOpen(this.host, this.port, projectDir);
+    const tasks = await listTasksStrict(this.host, this.port, projectDir);
+    if (!tasks.some((task) => task.id === taskId)) {
+      throw new Error(`Session not found: ${sessionId} (no AiderDesk task "${taskId}" in ${projectDir})`);
     }
 
-    const state = await loadTask(this.host, this.port, session.cwd || cwd, sessionId);
-    if (state) {
-      await replayTaskMessages(sessionId, state.messages, cx);
+    const mode = replayMode();
+    if (mode !== 'off') {
+      const state = await loadTaskStrict(this.host, this.port, projectDir, taskId);
+      await replayTaskMessages(
+        sessionId,
+        mode === 'tail' ? state.messages.slice(-REPLAY_TAIL_MESSAGES) : state.messages,
+        cx,
+      );
     }
+
+    await rememberSessionTask(sessionId, taskId, projectDir);
 
     return {
       modes: buildModeState(session.allModes, session.mode),
@@ -396,18 +546,27 @@ export class AcpAgent {
   async resumeSession(params: acp.ResumeSessionRequest, cx: acp.AgentContext): Promise<acp.ResumeSessionResponse> {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
-    const additionalInstructions = extractAdditionalInstructions(params);
+    const standingPrompt = extractStandingPrompt(params);
 
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = await this.createSession(cwd, sessionId);
+      const mappedTaskId = (await resolveSessionTask(sessionId)) ?? sessionId;
+      session = await this.createSession(cwd, mappedTaskId);
       this.sessions.set(sessionId, session);
     }
-    if (additionalInstructions) {
-      session.additionalInstructions = additionalInstructions;
+    await this.applyStandingPrompt(session, sessionId, standingPrompt);
+
+    // Same contract as `session/load`: a task that is gone has to read as a
+    // missing session, and a failed list request must not look like one either.
+    const projectDir = session.cwd || cwd;
+    const taskId = session.taskId ?? sessionId;
+    await ensureProjectOpen(this.host, this.port, projectDir);
+    const tasks = await listTasksStrict(this.host, this.port, projectDir);
+    if (!tasks.some((task) => task.id === taskId)) {
+      throw new Error(`Session not found: ${sessionId} (no AiderDesk task "${taskId}" in ${projectDir})`);
     }
 
-    await resumeTask(this.host, this.port, session.cwd || cwd, sessionId);
+    await resumeTask(this.host, this.port, projectDir, taskId);
 
     return {
       modes: buildModeState(session.allModes, session.mode),
@@ -434,6 +593,7 @@ export class AcpAgent {
     }
     await deleteTask(this.host, this.port, session.cwd, params.sessionId);
     this.sessions.delete(params.sessionId);
+    await forgetSessionTask(params.sessionId);
   }
 
   async prompt(params: acp.PromptRequest, cx: acp.AgentContext): Promise<acp.PromptResponse> {
@@ -519,15 +679,20 @@ export class AcpAgent {
     cx: acp.AgentContext,
     options?: { autonomyMode?: string },
   ): Promise<acp.PromptResponse> {
+    // A standing prompt that could not be written as a project rules file is
+    // prepended once, preserving the pre-rules fallback behaviour.
+    let text = promptText;
+    if (session.pendingStandingPrompt) {
+      text = `${session.pendingStandingPrompt}\n\n${text}`;
+      session.pendingStandingPrompt = undefined;
+    }
+
     const requestBody: Record<string, unknown> = {
-      prompt: promptText,
+      prompt: text,
       projectDir: session.cwd,
       mode: session.mode,
       autonomyMode: options?.autonomyMode ?? session.autonomyMode,
     };
-    if (session.additionalInstructions) {
-      requestBody.additionalInstructions = session.additionalInstructions;
-    }
     if (session.taskId) {
       requestBody.taskId = session.taskId;
     }
@@ -548,10 +713,11 @@ export class AcpAgent {
 
     if (sseResponse.taskId && !session.taskId) {
       session.taskId = sseResponse.taskId;
+      await rememberSessionTask(sessionId, session.taskId, session.cwd);
     }
     session.sseStream = sseResponse.stream;
 
-    return relaySse(session, sessionId, promptText, sseResponse.stream, cx, abortController);
+    return relaySse(this.host, this.port, session, sessionId, promptText, sseResponse.stream, cx, abortController);
   }
 
   /**
@@ -642,6 +808,7 @@ export class AcpAgent {
           const name = args.join(' ').trim() || undefined;
           const taskId = await createTask(this.host, this.port, session.cwd, name);
           session.taskId = taskId;
+          await rememberSessionTask(sessionId, taskId, session.cwd);
           await notifyThought(cx, sessionId, `Started a new task${name ? `: ${name}` : ''}.`);
           return { stopReason: 'end_turn' };
         }
@@ -673,6 +840,7 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           session.taskId = task.id;
+          await rememberSessionTask(sessionId, task.id, session.cwd);
           await notifyThought(
             cx,
             sessionId,
@@ -715,6 +883,7 @@ export class AcpAgent {
           const newTaskId = await handoffConversation(this.host, this.port, session.cwd, session.taskId, focus);
           if (newTaskId) {
             session.taskId = newTaskId;
+            await rememberSessionTask(sessionId, newTaskId, session.cwd);
             await notifyThought(cx, sessionId, 'Conversation handed off.');
           } else {
             await notifyThought(
@@ -790,9 +959,12 @@ export class AcpAgent {
  * response can carry a session-cumulative `usage` (ACP experimental field).
  */
 async function relaySse(
+  host: string,
+  port: number,
   session: AcpSession,
   sessionId: string,
-  promptText: string,
+  /** What the user actually sent, echoed back on `user-message` (never the standing prompt). */
+  userText: string,
   stream: ReadableStream<Uint8Array>,
   cx: acp.AgentContext,
   abortController: AbortController,
@@ -925,6 +1097,11 @@ async function relaySse(
         break;
       }
 
+      case 'ask-question': {
+        await answerPendingQuestion(host, port, session, sessionId, eventData, cx);
+        break;
+      }
+
       case 'log': {
         if (eventData.message && eventData.level !== 'loading') {
           await cx.notify(acp.methods.client.session.update, {
@@ -960,7 +1137,7 @@ async function relaySse(
             update: {
               sessionUpdate: 'user_message_chunk',
               messageId: eventData.messageId,
-              content: { type: 'text', text: promptText },
+              content: { type: 'text', text: userText },
             },
           });
         }
@@ -1103,6 +1280,51 @@ function withUsage(session: AcpSession, base: { stopReason: acp.PromptResponse['
       ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
     },
   };
+}
+
+/** Shorten free text for a one-line status note. */
+function truncateText(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * Answer an AiderDesk question on behalf of a client without an approval
+ * surface. The server blocks the turn on `task.askQuestion()`, so a question
+ * nobody answers leaves the turn waiting for the SSE timeout.
+ */
+async function answerPendingQuestion(
+  host: string,
+  port: number,
+  session: AcpSession,
+  sessionId: string,
+  data: EventData,
+  cx: acp.AgentContext,
+): Promise<void> {
+  if (!autoAnswersQuestions()) {
+    return;
+  }
+
+  const taskId = data.taskId ?? session.taskId;
+  if (!taskId) {
+    return;
+  }
+
+  const chosen = chooseQuestionAnswer(data, answerMode());
+  // A question without options needs free text, which this API cannot carry.
+  // Decline it instead of submitting a meaningless "y": the turn ends either
+  // way, and a decline is at least honest about not having an answer.
+  const answer = chosen ?? 'n';
+  const questionText = data.text ?? data.question ?? data.message ?? 'question';
+
+  try {
+    await answerQuestion(host, port, data.baseDir || session.cwd, taskId, answer);
+    const how = chosen
+      ? `with "${answer}"`
+      : `with "${answer}" (free-text question, declined: no options)`;
+    await notifyThought(cx, sessionId, `Auto-answered "${truncateText(questionText, 160)}" ${how}.`);
+  } catch (error) {
+    process.stderr.write(`Failed to auto-answer question: ${String(error)}\n`);
+  }
 }
 
 /** Send a plain-text agent thought to the client (used for local errors). */
