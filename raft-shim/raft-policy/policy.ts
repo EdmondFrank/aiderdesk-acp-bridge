@@ -248,6 +248,255 @@ export function elideToolResults<M extends PolicyMessage>(
     return { messages: rewritten, stats };
 }
 
+/** How far a tool result was cut: `soft` keeps the head, `hard` the minimum. */
+export type ElisionDecision = 'soft' | 'hard';
+
+/**
+ * Decisions already taken, keyed by `toolCallId`.
+ *
+ * A result that has a decision is never re-decided. That is the whole point:
+ * the provider caches a request prefix, so re-deciding an old result (as the
+ * single-pass version does when the retained-character budget shifts) rewrites
+ * text near the start of the conversation and makes everything after it be
+ * billed again at full price.
+ */
+export type ElisionMemo = Map<string, ElisionDecision>;
+
+type MemoCandidate = {
+    messageIndex: number;
+    partIndex: number;
+    key: string;
+    length: number;
+};
+
+/** Identity of a tool result that survives across turns. */
+function candidateKey(part: unknown, messageIndex: number, partIndex: number): string {
+    const toolCallId = asRecord(part)?.toolCallId;
+    return typeof toolCallId === 'string' && toolCallId ? toolCallId : `${messageIndex}:${partIndex}`;
+}
+
+/** Head length a decision leaves behind. */
+function headCharsFor(decision: ElisionDecision, options: ElisionOptions): number {
+    return decision === 'hard' ? Math.min(options.maxChars, HARD_CUT_CHARS) : options.maxChars;
+}
+
+/** Length of the text a decision leaves behind: the head plus the elision note. */
+function cutLengthOf(length: number, decision: ElisionDecision, options: ElisionOptions): number {
+    const head = headCharsFor(decision, options);
+    return head + elisionNote(Math.max(length - head, 0)).length;
+}
+
+function memoCandidates(messages: PolicyMessage[]): MemoCandidate[] {
+    const candidates: MemoCandidate[] = [];
+    messages.forEach((message, messageIndex) => {
+        if (!message || message.role !== 'tool' || !Array.isArray(message.content)) {
+            return;
+        }
+        message.content.forEach((part, partIndex) => {
+            if (asRecord(part)?.type !== 'tool-result') {
+                return;
+            }
+            const text = textOfToolResult(part);
+            if (text !== undefined) {
+                candidates.push({ messageIndex, partIndex, key: candidateKey(part, messageIndex, partIndex), length: text.length });
+            }
+        });
+    });
+    return candidates;
+}
+
+/**
+ * Decide which stale results to cut, recording each decision in `memo`.
+ *
+ * Intended to run when a fresh wake starts — a moment the provider cache has
+ * either expired or is about to — rather than on every dispatch. Results that
+ * already carry a decision are only accounted for, never re-decided, so the
+ * emitted prefix stays identical for the rest of the wake.
+ *
+ * @returns the number of results decided by this pass.
+ */
+export function decideElisions(
+    messages: PolicyMessage[],
+    options: ElisionOptions,
+    memo: ElisionMemo,
+): number {
+    const candidates = memoCandidates(messages);
+    if (candidates.length <= options.keepRecent) {
+        return 0;
+    }
+
+    const droppable = candidates.slice(0, candidates.length - options.keepRecent);
+    let retained = 0;
+    let decided = 0;
+
+    for (let index = droppable.length - 1; index >= 0; index--) {
+        const candidate = droppable[index];
+        const existing = memo.get(candidate.key);
+        if (existing) {
+            retained += cutLengthOf(candidate.length, existing, options);
+            continue;
+        }
+
+        const overBudget = retained > options.budgetChars;
+        if (!overBudget && candidate.length <= options.maxChars) {
+            retained += candidate.length;
+            continue;
+        }
+
+        const decision: ElisionDecision = overBudget ? 'hard' : 'soft';
+        const cut = cutLengthOf(candidate.length, decision, options);
+        if (candidate.length - cut < MIN_GAIN_CHARS) {
+            retained += candidate.length;
+            continue;
+        }
+
+        memo.set(candidate.key, decision);
+        retained += cut;
+        decided += 1;
+    }
+
+    return decided;
+}
+
+/**
+ * Emit the cuts `memo` already decided. Messages without a decision are
+ * returned as-is (by identity), so an unchanged conversation keeps its cache.
+ */
+export function applyElisions(
+    messages: PolicyMessage[],
+    memo: ElisionMemo,
+    options: ElisionOptions = DEFAULT_ELISION_OPTIONS,
+): { messages: PolicyMessage[]; stats: ElisionStats } {
+    const stats: ElisionStats = { elided: 0, savedChars: 0 };
+    if (memo.size === 0) {
+        return { messages, stats };
+    }
+
+    const replacements = new Map<string, unknown>();
+
+    messages.forEach((message, messageIndex) => {
+        if (!message || message.role !== 'tool' || !Array.isArray(message.content)) {
+            return;
+        }
+        message.content.forEach((part, partIndex) => {
+            const decision = memo.get(candidateKey(part, messageIndex, partIndex));
+            if (!decision) {
+                return;
+            }
+            const original = textOfToolResult(part);
+            if (original === undefined) {
+                return;
+            }
+            const elided = elidePart(part, headCharsFor(decision, options), original);
+            if (!elided) {
+                return;
+            }
+            const saved = original.length - elided.textLength;
+            // Nothing left to save: the stored text is already this short.
+            if (saved <= 0) {
+                return;
+            }
+            replacements.set(`${messageIndex}:${partIndex}`, elided.part);
+            stats.elided += 1;
+            stats.savedChars += saved;
+        });
+    });
+
+    if (replacements.size === 0) {
+        return { messages, stats };
+    }
+
+    const rewritten = messages.map((message, messageIndex) => {
+        if (!message || message.role !== 'tool' || !Array.isArray(message.content)) {
+            return message;
+        }
+        let changed = false;
+        const content = (message.content as unknown[]).map((part, partIndex) => {
+            const replacement = replacements.get(`${messageIndex}:${partIndex}`);
+            if (replacement === undefined) {
+                return part;
+            }
+            changed = true;
+            return replacement;
+        });
+        return changed ? { ...message, content } : message;
+    });
+
+    return { messages: rewritten, stats };
+}
+
+/** Characters the tool results in `messages` would occupy under `memo`. */
+export function effectiveToolResultChars(
+    messages: PolicyMessage[],
+    memo: ElisionMemo,
+    options: ElisionOptions = DEFAULT_ELISION_OPTIONS,
+): number {
+    let total = 0;
+    for (const candidate of memoCandidates(messages)) {
+        const decision = memo.get(candidate.key);
+        total += decision ? cutLengthOf(candidate.length, decision, options) : candidate.length;
+    }
+    return total;
+}
+
+/**
+ * What the tool results in a request cost under `memo`, split by whether a pass
+ * has looked at them yet.
+ *
+ * `pendingChars` is the growth signal: stale results that no pass has decided
+ * about are what make the context creep up, and they are what a pass shrinks.
+ */
+export type ElisionBudget = {
+    /** Tool results in the request. */
+    candidates: number;
+    /** Characters those results occupy under `memo`. */
+    totalChars: number;
+    /** Characters of stale results (beyond `keepRecent`) with no decision. */
+    pendingChars: number;
+};
+
+export function elisionBudget(
+    messages: PolicyMessage[],
+    memo: ElisionMemo,
+    options: ElisionOptions = DEFAULT_ELISION_OPTIONS,
+): ElisionBudget {
+    const candidates = memoCandidates(messages);
+    const droppable = Math.max(candidates.length - options.keepRecent, 0);
+    let totalChars = 0;
+    let pendingChars = 0;
+
+    candidates.forEach((candidate, index) => {
+        const decision = memo.get(candidate.key);
+        totalChars += decision ? cutLengthOf(candidate.length, decision, options) : candidate.length;
+        // Only results a pass would actually cut count as growth; one that is
+        // already shorter than `maxChars` is never worth cutting, and counting
+        // it would make the growth trigger fire forever.
+        if (index < droppable && !decision && candidate.length > options.maxChars) {
+            pendingChars += candidate.length;
+        }
+    });
+
+    return { candidates: candidates.length, totalChars, pendingChars };
+}
+
+/** When a dispatch counts as a fresh wake, and how large results may grow. */
+export type PolicyRuntime = {
+    /** A gap at least this long starts a new wake, where deciding cuts is free. */
+    epochIdleMs: number;
+    /** Tool results above this size force a decision pass even mid-wake. */
+    ceilingChars: number;
+    /** Stale, undecided characters worth a mid-wake pass (one cache break). */
+    pendingChars: number;
+};
+
+export function policyRuntimeFromEnv(env: Record<string, string | undefined>): PolicyRuntime {
+    return {
+        epochIdleMs: readInt(env, 'AIDERDESK_RAFT_ELIDE_AFTER_IDLE_MS', 30 * 60_000, 0, 24 * 60 * 60_000),
+        ceilingChars: readInt(env, 'AIDERDESK_RAFT_TOOL_RESULT_CEILING_CHARS', 400_000, 0, 100_000_000),
+        pendingChars: readInt(env, 'AIDERDESK_RAFT_ELIDE_PENDING_CHARS', 160_000, 0, 100_000_000),
+    };
+}
+
 function readInt(
     env: Record<string, string | undefined>,
     name: string,

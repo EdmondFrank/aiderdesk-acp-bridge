@@ -2,8 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   DEFAULT_ELISION_OPTIONS,
+  applyElisions,
+  decideElisions,
+  effectiveToolResultChars,
   elideToolResults,
+  elisionBudget,
   elisionOptionsFromEnv,
+  policyRuntimeFromEnv,
   raftPolicyEnabled,
   type PolicyMessage,
 } from '../raft-shim/raft-policy/policy';
@@ -168,5 +173,130 @@ describe('raftPolicyEnabled', () => {
     expect(raftPolicyEnabled('/home/x/project', {})).toBe(false);
     expect(raftPolicyEnabled('/home/x/project', { AIDERDESK_RAFT_POLICY: '1' })).toBe(true);
     expect(raftPolicyEnabled('/Users/x/.raft/agents/abc', { AIDERDESK_RAFT_POLICY: '0' })).toBe(false);
+  });
+});
+describe('decideElisions / applyElisions', () => {
+  const options = { keepRecent: 1, maxChars: 100, budgetChars: 0 };
+
+  function threeResults(): PolicyMessage[] {
+    return [
+      toolMessage('a'.repeat(2000), 'call-1'),
+      toolMessage('b'.repeat(2000), 'call-2'),
+      toolMessage('c'.repeat(10), 'call-3'),
+    ];
+  }
+
+  test('records one decision per tool call and never revisits it', () => {
+    const memo = new Map();
+    const messages = threeResults();
+
+    expect(decideElisions(messages, options, memo)).toBe(2);
+    expect(memo.size).toBe(2);
+
+    // A later pass over the same results decides nothing new, even though the
+    // retained budget would now allow a different cut.
+    expect(decideElisions(messages, { ...options, budgetChars: 10_000_000 }, memo)).toBe(0);
+    expect(memo.size).toBe(2);
+  });
+
+  test('replays the same text on every turn so the prompt cache stays warm', () => {
+    const memo = new Map();
+    decideElisions(threeResults(), options, memo);
+
+    const first = applyElisions(threeResults(), memo, options);
+    const laterSource = threeResults();
+    const later = applyElisions(laterSource, memo, options);
+
+    expect(textOf(first.messages[0])).toBe(textOf(later.messages[0]));
+    expect(first.stats).toEqual(later.stats);
+    // The untouched recent result keeps its identity.
+    expect(later.messages[2]).toBe(laterSource[2]);
+  });
+
+  test('returns the same array when nothing was decided', () => {
+    const messages = threeResults();
+    const result = applyElisions(messages, new Map(), options);
+
+    expect(result.messages).toBe(messages);
+    expect(result.stats.elided).toBe(0);
+  });
+
+  test('reports the size the memo would actually send', () => {
+    const memo = new Map();
+    const messages = threeResults();
+    const before = effectiveToolResultChars(messages, memo, options);
+    decideElisions(messages, options, memo);
+
+    expect(effectiveToolResultChars(messages, memo, options)).toBeLessThan(before / 2);
+  });
+});
+
+describe('policyRuntimeFromEnv', () => {
+  test('defaults to a 30 minute wake, a 400k ceiling and 160k of pending growth', () => {
+    expect(policyRuntimeFromEnv({})).toEqual({
+      epochIdleMs: 30 * 60_000,
+      ceilingChars: 400_000,
+      pendingChars: 160_000,
+    });
+    expect(
+      policyRuntimeFromEnv({
+        AIDERDESK_RAFT_ELIDE_AFTER_IDLE_MS: '0',
+        AIDERDESK_RAFT_TOOL_RESULT_CEILING_CHARS: '1000',
+        AIDERDESK_RAFT_ELIDE_PENDING_CHARS: '5000',
+      }),
+    ).toEqual({ epochIdleMs: 0, ceilingChars: 1000, pendingChars: 5000 });
+  });
+});
+
+describe('elisionBudget', () => {
+  const options = { keepRecent: 2, maxChars: 4000, budgetChars: 120_000 };
+
+  const conversation = (): PolicyMessage[] => [
+    toolMessage('a'.repeat(9000), 'old-1'),
+    toolMessage('b'.repeat(9000), 'old-2'),
+    toolMessage('c'.repeat(9000), 'recent-1'),
+    toolMessage('d'.repeat(9000), 'recent-2'),
+  ];
+
+  test('counts stale results as pending until a pass decides them', () => {
+    const memo = new Map();
+    const before = elisionBudget(conversation(), memo, options);
+    expect(before.candidates).toBe(4);
+    expect(before.pendingChars).toBe(18_000);
+    expect(before.totalChars).toBe(36_000);
+
+    decideElisions(conversation(), options, memo);
+
+    const after = elisionBudget(conversation(), memo, options);
+    expect(after.pendingChars).toBe(0);
+    expect(after.totalChars).toBeLessThan(before.totalChars);
+  });
+
+  test('keeps results inside the recent window out of the pending total', () => {
+    const budget = elisionBudget(conversation(), new Map(), { ...options, keepRecent: 4 });
+    expect(budget.candidates).toBe(4);
+    expect(budget.pendingChars).toBe(0);
+  });
+
+  test('ignores stale results a pass would never cut', () => {
+    const small: PolicyMessage[] = [
+      toolMessage('x'.repeat(1200), 'small-1'),
+      toolMessage('y'.repeat(1200), 'small-2'),
+      toolMessage('z'.repeat(1200), 'small-3'),
+    ];
+    const budget = elisionBudget(small, new Map(), options);
+    expect(budget.candidates).toBe(3);
+    expect(budget.pendingChars).toBe(0);
+    expect(budget.totalChars).toBe(3600);
+  });
+
+  test('reports the size a decided result is actually sent at', () => {
+    const memo = new Map();
+    decideElisions(conversation(), options, memo);
+    const budget = elisionBudget(conversation(), memo, options);
+    // Two stale results cut to a 4000-char head plus a note each, the two
+    // recent ones untouched.
+    expect(budget.totalChars).toBeGreaterThan(18_000);
+    expect(budget.totalChars).toBeLessThan(18_000 + 4000 * 2 + 400);
   });
 });

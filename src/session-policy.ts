@@ -243,3 +243,69 @@ export async function forgetSessionTask(sessionId: string): Promise<void> {
     log(`failed to drop session mapping: ${String(error)}`);
   }
 }
+
+/**
+ * Raft sends its whole standing prompt twice: once in
+ * `_meta.systemPromptOverride` (which becomes system rules) and again as the
+ * first `session/prompt`. The two copies stay in the conversation for the rest
+ * of the task — ~32 KB, or ~10k tokens, paid on every cold start and carried
+ * through every compaction.
+ */
+const REPEAT_MIN_LENGTH_RATIO = 0.7;
+const REPEAT_MAX_LENGTH_RATIO = 1.5;
+const REPEAT_SAMPLES = 5;
+const REPEAT_WINDOW = 400;
+const REPEAT_MIN_MATCHES = 4;
+/** Kept from the original prompt: the part most likely to carry fresh state. */
+const REPEAT_TAIL_CHARS = 3000;
+
+function normalizeForComparison(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Whether a prompt is a re-send of the standing prompt.
+ *
+ * Compared by sampling fixed windows rather than scanning a common prefix: the
+ * two copies differ in small details (role lines, host names, an appended
+ * runtime note), so they drift apart a few hundred characters in while still
+ * being the same document.
+ */
+export function isStandingPromptRepeat(prompt: string, standing: string): boolean {
+  if (!prompt || !standing) {
+    return false;
+  }
+  const candidate = normalizeForComparison(prompt);
+  const reference = normalizeForComparison(standing);
+  if (
+    candidate.length < reference.length * REPEAT_MIN_LENGTH_RATIO ||
+    candidate.length > reference.length * REPEAT_MAX_LENGTH_RATIO
+  ) {
+    return false;
+  }
+
+  let matches = 0;
+  for (let index = 0; index < REPEAT_SAMPLES; index++) {
+    const start = Math.floor(((candidate.length - REPEAT_WINDOW) * index) / (REPEAT_SAMPLES - 1));
+    if (reference.includes(candidate.slice(start, start + REPEAT_WINDOW))) {
+      matches += 1;
+    }
+  }
+  return matches >= REPEAT_MIN_MATCHES;
+}
+
+/**
+ * Replacement for a repeated standing prompt: a note plus the tail of the
+ * original, which is where Raft puts the state that is not in the standing text
+ * (unread messages, wake reason). Everything before it is already system rules.
+ */
+export function buildStandingPromptStub(prompt: string): string {
+  const tail = prompt.slice(-REPEAT_TAIL_CHARS);
+  const lineBreak = tail.indexOf('\n');
+  const body = lineBreak > 0 ? tail.slice(lineBreak + 1) : tail;
+  return [
+    '[Standing prompt already delivered as system rules — not repeated here.]',
+    '',
+    body.trim(),
+  ].join('\n');
+}

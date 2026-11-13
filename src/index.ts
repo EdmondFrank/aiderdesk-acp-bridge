@@ -2,8 +2,9 @@
 import * as acp from '@agentclientprotocol/sdk';
 
 import { AcpAgent, getVersion } from './agent';
-import { DEFAULT_HOST, DEFAULT_PORT, resolvePort } from './constants';
+import { DEFAULT_HOST, DEFAULT_PORT, START_HEALTH_WAIT_MS, resolvePort } from './constants';
 import { fetchJSON } from './http';
+import { waitForHealth } from './health';
 
 function printUsage(): void {
   console.log(`
@@ -19,6 +20,7 @@ Options:
   -h, --help          Show this help
 
 Environment:
+  AIDER_DESK_ACP_START_WAIT_MS How long to wait for AiderDesk at startup (default: 90000)
   AIDER_DESK_JSON_TIMEOUT_MS   Timeout for plain JSON REST calls (default: 10000)
   AIDER_DESK_SSE_TIMEOUT_MS    Timeout for streaming turns and model-waiting
                                calls; bounds the whole turn (default: 1800000)
@@ -80,15 +82,35 @@ function parseArgs(argv: string[]): CliOptions {
 }
 
 async function startAcpAgent(host: string, port: number): Promise<void> {
-  try {
-    const health = await fetchJSON(host, port, '/api/health', 'GET');
-    const healthData = health.data as { status?: string };
-    if (health.status !== 200 || healthData.status !== 'ok') {
-      process.stderr.write('Error: AiderDesk server is not healthy.\n');
-      process.exit(1);
-    }
-  } catch {
-    process.stderr.write(`Error: AiderDesk server is not running on ${host}:${port}. Start it first with 'aiderdesk' or 'aiderdesk start'.\n`);
+  // AiderDesk is often restarted together with the agent, so the first probe can
+  // land while its REST server is still binding. Dying here is what leaves Raft
+  // showing "Crashed (exit code 1)" until someone starts the agent by hand.
+  const health = await waitForHealth(
+    async () => {
+      try {
+        const response = await fetchJSON(host, port, '/api/health', 'GET');
+        const data = response.data as { status?: string };
+        if (response.status === 200 && data.status === 'ok') {
+          return { ok: true };
+        }
+        return { ok: false, reason: `status ${response.status}` };
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    {
+      budgetMs: START_HEALTH_WAIT_MS,
+      onRetry: (attempt) => {
+        process.stderr.write(`Waiting for AiderDesk on ${host}:${port} (attempt ${attempt + 1})\n`);
+      },
+    },
+  );
+
+  if (!health.ok) {
+    process.stderr.write(
+      `Error: AiderDesk server is not running on ${host}:${port} after ${Math.round(START_HEALTH_WAIT_MS / 1000)}s ` +
+        `(${health.reason ?? 'no response'}). Start it with 'aiderdesk start' and start the agent again.\n`,
+    );
     process.exit(1);
   }
 

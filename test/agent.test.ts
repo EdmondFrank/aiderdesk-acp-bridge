@@ -839,14 +839,15 @@ describe('AcpAgent', () => {
       seenBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
       return new Response(JSON.stringify({ message: 'Conversation smart-compacted' }), { status: 200 });
     });
-    router.add('GET', '/api/readonly/tasks/task-1', () =>
-      new Response(
-        JSON.stringify({
-          messages: [{ type: 'response-completed', messageId: 'm2', content: 'Smart summary.' }],
-        }),
-        { status: 200 },
-      ),
-    );
+    let contextReads = 0;
+    router.add('GET', '/api/readonly/tasks/task-1', () => {
+      contextReads += 1;
+      const messages =
+        contextReads === 1
+          ? [{ type: 'response-completed', messageId: 'm1', content: 'x'.repeat(20_000) }]
+          : [{ type: 'response-completed', messageId: 'm2', content: 'Smart summary.' }];
+      return new Response(JSON.stringify({ messages }), { status: 200 });
+    });
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
@@ -871,6 +872,50 @@ describe('AcpAgent', () => {
     expect(((summaryThought.params as { update: { content: { text: string } } }).update.content.text)).toContain(
       'Smart summary.',
     );
+  });
+
+  test('/smart-compact reports a no-op instead of relaying a fake summary', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('POST', '/api/project/smart-compact-conversation', () =>
+      new Response(JSON.stringify({ message: 'Conversation smart-compacted' }), { status: 200 }),
+    );
+    // The context is identical before and after: smart compaction rewrote nothing.
+    router.add('GET', '/api/readonly/tasks/task-1', () =>
+      new Response(
+        JSON.stringify({
+          messages: [{ type: 'response-completed', messageId: 'm2', content: 'Replied in the DM.' }],
+        }),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(sseBody([{ type: 'stream-end', data: {} }]), { status: 200, headers: { 'x-task-id': 'task-1' } }),
+    );
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hello' }] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/smart-compact' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    const thoughts = notifyCalls
+      .filter((c) => (c.params as { update: { sessionUpdate: string } }).update.sessionUpdate === 'agent_thought_chunk')
+      .map((c) => (c.params as { update: { content: { text: string } } }).update.content.text);
+    const last = thoughts[thoughts.length - 1];
+    expect(last).toContain('Nothing to compact');
+    expect(last).not.toContain('Replied in the DM.');
   });
 
   test('/compact falls back to the plain note when the summary cannot be fetched', async () => {

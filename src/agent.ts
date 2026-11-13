@@ -13,7 +13,15 @@ import {
   toAvailableCommands,
   validateRequiredArguments,
 } from './commands';
-import { DEFAULT_AUTONOMY_MODE, DEFAULT_MODE, type ModeOption } from './constants';
+import { contextCharsOf, evaluateCompaction } from './compaction-report';
+import {
+  DEDUPE_STANDING_PROMPT,
+  DEFAULT_AUTONOMY_MODE,
+  DEFAULT_MODE,
+  IDLE_COMPACT_DELAY_MS,
+  IDLE_COMPACT_TOKENS,
+  type ModeOption,
+} from './constants';
 import {
   answerQuestion,
   callInterrupt,
@@ -51,8 +59,10 @@ import {
   type ModelInfo,
 } from './modes';
 import {
+  buildStandingPromptStub,
   clearStandingPrompt,
   forgetSessionTask,
+  isStandingPromptRepeat,
   rememberSessionTask,
   resolveSessionTask,
   writeStandingPrompt,
@@ -146,6 +156,16 @@ export type AcpSession = {
   model?: string;
   commands: CommandsData;
   usage: AcpSessionUsage;
+  /** Set once the first user prompt went through; only that one is deduped. */
+  firstPromptSent?: boolean;
+  /** Input tokens of the last turn: `sent + received + cache read`. */
+  lastContextTokens?: number;
+  /** Pending idle compaction, cancelled as soon as another prompt arrives. */
+  idleCompactTimer?: ReturnType<typeof setTimeout>;
+  /** The in-flight idle compaction, so an arriving prompt can wait for it. */
+  idleCompaction?: Promise<void>;
+  /** Set when idle compaction measured as a no-op, so it stops retrying. */
+  idleCompactUseless?: boolean;
 };
 
 /**
@@ -591,6 +611,7 @@ export class AcpAgent {
     if (!session?.cwd) {
       return;
     }
+    this.cancelIdleCompaction(session);
     await deleteTask(this.host, this.port, session.cwd, params.sessionId);
     this.sessions.delete(params.sessionId);
     await forgetSessionTask(params.sessionId);
@@ -604,9 +625,12 @@ export class AcpAgent {
 
     const abortController = new AbortController();
     session.abortController = abortController;
+    this.cancelIdleCompaction(session);
+    await this.awaitIdleCompaction(session);
 
     try {
-      const { prompt: promptText, images } = contentBlocksToPrompt(params.prompt);
+      const { prompt: rawPrompt, images } = contentBlocksToPrompt(params.prompt);
+      const promptText = this.dedupeFirstPrompt(session, params.sessionId, rawPrompt, cx);
 
       if (!promptText && images.length === 0) {
         return { stopReason: 'end_turn' };
@@ -663,6 +687,9 @@ export class AcpAgent {
     } finally {
       session.abortController = undefined;
       session.sseStream = undefined;
+      if (!abortController.signal.aborted) {
+        this.scheduleIdleCompaction(session, params.sessionId, cx);
+      }
     }
   }
 
@@ -808,6 +835,8 @@ export class AcpAgent {
           const name = args.join(' ').trim() || undefined;
           const taskId = await createTask(this.host, this.port, session.cwd, name);
           session.taskId = taskId;
+          session.lastContextTokens = 0;
+          session.idleCompactUseless = false;
           await rememberSessionTask(sessionId, taskId, session.cwd);
           await notifyThought(cx, sessionId, `Started a new task${name ? `: ${name}` : ''}.`);
           return { stopReason: 'end_turn' };
@@ -840,6 +869,8 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           session.taskId = task.id;
+          session.lastContextTokens = 0;
+          session.idleCompactUseless = false;
           await rememberSessionTask(sessionId, task.id, session.cwd);
           await notifyThought(
             cx,
@@ -862,7 +893,9 @@ export class AcpAgent {
             session.mode,
             customInstructions,
           );
-          await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation compacted.');
+          if (await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation compacted.')) {
+            session.lastContextTokens = 0;
+          }
           return { stopReason: 'end_turn' };
         }
         case 'smart-compact': {
@@ -870,8 +903,20 @@ export class AcpAgent {
             await notifyThought(cx, sessionId, 'No conversation to compact yet. Send a message first.');
             return { stopReason: 'end_turn' };
           }
+          const beforeChars = contextCharsOf(await fetchTask(this.host, this.port, session.cwd, session.taskId));
           await smartCompactConversation(this.host, this.port, session.cwd, session.taskId);
-          await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation smart-compacted.');
+          if (
+            await this.notifyCompactionResult(
+              cx,
+              sessionId,
+              session.cwd,
+              session.taskId,
+              'Conversation smart-compacted.',
+              { beforeChars },
+            )
+          ) {
+            session.lastContextTokens = 0;
+          }
           return { stopReason: 'end_turn' };
         }
         case 'handoff': {
@@ -883,6 +928,8 @@ export class AcpAgent {
           const newTaskId = await handoffConversation(this.host, this.port, session.cwd, session.taskId, focus);
           if (newTaskId) {
             session.taskId = newTaskId;
+            session.lastContextTokens = 0;
+            session.idleCompactUseless = false;
             await rememberSessionTask(sessionId, newTaskId, session.cwd);
             await notifyThought(cx, sessionId, 'Conversation handed off.');
           } else {
@@ -906,10 +953,10 @@ export class AcpAgent {
   }
 
   /**
-   * After a compaction, relay the server's new compacted context summary to
-   * the client so the session reflects what replaced the conversation.
-   * Best-effort: falls back to the plain confirmation note when the summary
-   * can't be fetched.
+   * After a compaction, relay the server's new compacted context summary to the
+   * client so the session reflects what replaced the conversation. Returns
+   * whether the context actually shrank: a compaction that changed nothing has
+   * no summary to relay and must not be announced as one.
    */
   private async notifyCompactionResult(
     cx: acp.AgentContext,
@@ -917,13 +964,25 @@ export class AcpAgent {
     projectDir: string,
     taskId: string,
     fallbackText: string,
-  ): Promise<void> {
-    const summary = extractCompactionSummary(await fetchTask(this.host, this.port, projectDir, taskId));
+    options: { beforeChars?: number; background?: boolean } = {},
+  ): Promise<boolean> {
+    const messages = await fetchTask(this.host, this.port, projectDir, taskId);
+    const outcome = evaluateCompaction(options.beforeChars, contextCharsOf(messages));
+    if (!outcome.shrank) {
+      process.stderr.write(`[compaction] ${fallbackText} changed nothing (${outcome.detail})\n`);
+      if (!options.background) {
+        await notifyThought(cx, sessionId, `Nothing to compact: the context is unchanged (${outcome.detail}).`);
+      }
+      return false;
+    }
+
+    const summary = extractCompactionSummary(messages);
     if (summary) {
       await notifyThought(cx, sessionId, `${fallbackText} The conversation was replaced by this summary:\n\n${summary}`);
-      return;
+      return true;
     }
     await notifyThought(cx, sessionId, fallbackText);
+    return true;
   }
 
   async cancel(params: acp.CancelNotification): Promise<void> {
@@ -949,6 +1008,137 @@ export class AcpAgent {
         // best-effort
       }
     }
+  }
+
+  /**
+   * Raft repeats its standing prompt as the first `session/prompt`, on top of
+   * `_meta.systemPromptOverride` which already became a rules file. Forwarding
+   * the duplicate costs ~10k tokens on every cold start and survives every
+   * compaction, so the first prompt is reduced to a stub that keeps only its
+   * tail — where Raft appends state the standing text does not contain.
+   *
+   * Only the first prompt is considered: later messages are the user's.
+   */
+  private dedupeFirstPrompt(
+    session: AcpSession,
+    sessionId: string,
+    promptText: string,
+    cx: acp.AgentContext,
+  ): string {
+    if (session.firstPromptSent) {
+      return promptText;
+    }
+    session.firstPromptSent = true;
+
+    const standing = session.standingPrompt;
+    if (
+      !DEDUPE_STANDING_PROMPT ||
+      !standing ||
+      session.pendingStandingPrompt ||
+      !isStandingPromptRepeat(promptText, standing)
+    ) {
+      return promptText;
+    }
+
+    void notifyThought(
+      cx,
+      sessionId,
+      'First prompt repeated the standing prompt; sent a short stub instead (the full text is already system rules).',
+    ).catch(() => undefined);
+    return buildStandingPromptStub(promptText);
+  }
+
+  /**
+   * Compact a session that has gone quiet.
+   *
+   * A Raft agent is woken sporadically, and the provider's prompt cache expires
+   * between wakes, so the whole context is billed at input price on the first
+   * turn after a pause. Compacting while idle makes that turn small; compacting
+   * during an active burst would throw away a cache that is still warm, hence
+   * the debounce — the next prompt cancels the pending compaction.
+   */
+  private scheduleIdleCompaction(session: AcpSession, sessionId: string, cx: acp.AgentContext): void {
+    if (IDLE_COMPACT_TOKENS <= 0 || !session.taskId || session.idleCompactTimer || session.idleCompactUseless) {
+      return;
+    }
+    if ((session.lastContextTokens ?? 0) < IDLE_COMPACT_TOKENS) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      session.idleCompactTimer = undefined;
+      void this.runIdleCompaction(session, sessionId, cx);
+    }, IDLE_COMPACT_DELAY_MS);
+    (timer as { unref?: () => void }).unref?.();
+    session.idleCompactTimer = timer;
+  }
+
+  private cancelIdleCompaction(session: AcpSession): void {
+    if (session.idleCompactTimer) {
+      clearTimeout(session.idleCompactTimer);
+      session.idleCompactTimer = undefined;
+    }
+  }
+
+  private runIdleCompaction(session: AcpSession, sessionId: string, cx: acp.AgentContext): void {
+    const taskId = session.taskId;
+    if (!taskId || session.idleCompaction) {
+      return;
+    }
+
+    session.idleCompaction = (async () => {
+      try {
+        const beforeChars = contextCharsOf(await fetchTask(this.host, this.port, session.cwd, taskId));
+        await smartCompactConversation(this.host, this.port, session.cwd, taskId);
+        if (beforeChars === undefined) {
+          process.stderr.write('[idle-compact] context could not be read back, skipping the report\n');
+          return;
+        }
+
+        const shrank = await this.notifyCompactionResult(
+          cx,
+          sessionId,
+          session.cwd,
+          taskId,
+          'Compacted while idle to keep the next wake small.',
+          { beforeChars, background: true },
+        );
+        if (shrank) {
+          session.lastContextTokens = 0;
+          return;
+        }
+
+        // AiderDesk's smart compaction only rewrites its own `power` tool
+        // results, so a session built on MCP tools never shrinks. Retrying on
+        // every wake would only repeat the same no-op, so stop until the task
+        // changes.
+        session.idleCompactUseless = true;
+        process.stderr.write('[idle-compact] disabled for this task: smart compaction cannot shrink it\n');
+      } catch (error) {
+        process.stderr.write(`[idle-compact] compaction failed: ${String(error)}\n`);
+      }
+    })().finally(() => {
+      session.idleCompaction = undefined;
+    });
+  }
+
+  /**
+   * AiderDesk rejects a prompt for a task that is busy, so a prompt arriving
+   * while the debounce already fired waits for that one summary call instead of
+   * racing it. Bounded, because the message matters more than the compaction.
+   */
+  private async awaitIdleCompaction(session: AcpSession): Promise<void> {
+    const pending = session.idleCompaction;
+    if (!pending) {
+      return;
+    }
+    await Promise.race([
+      pending,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 120_000);
+        (timer as { unref?: () => void }).unref?.();
+      }),
+    ]);
   }
 }
 
@@ -1029,6 +1219,10 @@ async function relaySse(
           session.usage.outputTokens += usage.receivedTokens ?? 0;
           session.usage.cachedReadTokens += usage.cacheReadTokens ?? 0;
           session.usage.cachedWriteTokens += usage.cacheWriteTokens ?? 0;
+          // Same total the server uses for its compaction threshold: the whole
+          // prompt of this turn, cached prefix included.
+          session.lastContextTokens =
+            (usage.sentTokens ?? 0) + (usage.receivedTokens ?? 0) + (usage.cacheReadTokens ?? 0);
           await cx.notify(acp.methods.client.session.update, {
             sessionId,
             update: {

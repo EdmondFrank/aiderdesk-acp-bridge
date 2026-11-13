@@ -4,8 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  buildStandingPromptStub,
   clearStandingPrompt,
   forgetSessionTask,
+  isStandingPromptRepeat,
   rememberSessionTask,
   resolveSessionTask,
   rulesFilePath,
@@ -106,5 +108,37 @@ describe('session to task mapping', () => {
     for (const id of ids) {
       expect(await resolveSessionTask(id)).toBe(`task-${id}`);
     }
+  });
+});
+
+describe('repeated standing prompt', () => {
+  const standing = Array.from({ length: 200 }, (_, i) => `Rule ${i}: keep the workspace tidy and report progress.`).join('\n');
+
+  test('recognises the same document sent as the first prompt', () => {
+    // Raft's copy differs in details that are not part of the rules, so it is
+    // not a byte-identical duplicate.
+    const prompt = standing.replace('Rule 42: keep the workspace tidy', 'Rule 42: keep your workspace tidy') + '\n\nUnread: 3 messages';
+
+    expect(isStandingPromptRepeat(prompt, standing)).toBe(true);
+  });
+
+  test('ignores an unrelated prompt of similar length', () => {
+    const prompt = Array.from({ length: 200 }, (_, i) => `Task ${i}: refactor module ${i} and add tests.`).join('\n');
+
+    expect(isStandingPromptRepeat(prompt, standing)).toBe(false);
+  });
+
+  test('ignores a much shorter or much longer message', () => {
+    expect(isStandingPromptRepeat('hello', standing)).toBe(false);
+    expect(isStandingPromptRepeat(`${standing}\n${standing}\n${standing}`, standing)).toBe(false);
+  });
+
+  test('builds a stub that keeps the tail but drops the rules', () => {
+    const tail = 'Unread: 3 messages in #all';
+    const stub = buildStandingPromptStub(`${standing}\n\n${tail}`);
+
+    expect(stub).toContain('already delivered as system rules');
+    expect(stub).toContain(tail);
+    expect(stub.length).toBeLessThan(3500);
   });
 });

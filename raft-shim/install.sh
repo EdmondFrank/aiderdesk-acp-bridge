@@ -7,7 +7,9 @@
 #
 # It also installs the `raft-policy` AiderDesk extension (stale tool-result
 # elision). Set SKIP_EXTENSION=1 to leave ~/.aider-desk/extensions alone, and
-# AIDER_DESK_EXTENSIONS_DIR to install it elsewhere.
+# AIDER_DESK_EXTENSIONS_DIR to install it elsewhere. The extension only needs an
+# AiderDesk restart when you overwrite an existing copy in place; the bridge
+# itself (src/) needs the Raft agent runtime restarted.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -33,10 +35,27 @@ printf 'installed %s\n' "$BIN_DIR/aiderdesk"
 printf 'installed %s -> aiderdesk\n' "$BIN_DIR/grok"
 
 if [ "${SKIP_EXTENSION:-0}" != "1" ]; then
-    mkdir -p "$EXTENSIONS_DIR/raft-policy"
-    cp "$HERE/raft-policy/"*.ts "$EXTENSIONS_DIR/raft-policy/"
-    printf 'installed %s\n' "$EXTENSIONS_DIR/raft-policy"
-    printf 'a running AiderDesk server watches that directory and loads it automatically\n'
+    VERSION=$(sed -n "s/.*version: '\([^']*\)'.*/\1/p" "$HERE/raft-policy/index.ts" | head -1)
+    EXT_DIR="$EXTENSIONS_DIR/raft-policy-$VERSION"
+    # AiderDesk's extension loader keeps one jiti instance per extension
+    # directory and never invalidates it (extension-loader.ts:27). Reinstalling
+    # over a directory that was already loaded therefore re-reads `index.ts` but
+    # keeps the cached `./policy` module, and the extension silently falls back
+    # to an early policy that elides nothing — its onLoad log says "policy module
+    # is stale". A version-named directory puts every build on a fresh path.
+    for stale in "$EXTENSIONS_DIR"/raft-policy*; do
+        if [ -d "$stale" ] && [ "$stale" != "$EXT_DIR" ]; then
+            printf 'removing previous %s (two copies would elide twice)\n' "$stale"
+            rm -rf "$stale"
+        fi
+    done
+    mkdir -p "$EXT_DIR"
+    cp "$HERE/raft-policy/"*.ts "$EXT_DIR/"
+    printf 'installed %s\n' "$EXT_DIR"
+    printf 'NOTE: bump the version in raft-policy/index.ts to land on a fresh path; reinstalling the same version keeps the loaded copy.\n'
 fi
 
 printf 'restart Raft Computer if the runtime still shows as not installed: raft-computer restart /<server-slug>\n'
+printf 'NOTE: changes under src/ (the ACP bridge) only take effect after the agent runtime restarts.\n'
+printf '      The shim process is long-lived per agent; a running one keeps the OLD bridge code.\n'
+printf '      Check with: ps -eo pid,lstart,command | grep raft-shim/aiderdesk.ts\n'
