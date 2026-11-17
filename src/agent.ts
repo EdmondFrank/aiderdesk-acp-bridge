@@ -74,7 +74,6 @@ import {
   buildToolCallContentArray,
   contentBlocksToPrompt,
   extractFilePath,
-  formatToolInputAsText,
   formatToolTitle,
   generateSessionId,
   inferToolKind,
@@ -1487,7 +1486,6 @@ async function notifyToolCallStart(
 ): Promise<void> {
   const args = parseToolArgs(rawArgs);
   const filePath = extractFilePath(toolName, args);
-  const inputText = formatToolInputAsText(toolName, args);
 
   await cx.notify(acp.methods.client.session.update, {
     sessionId,
@@ -1499,9 +1497,6 @@ async function notifyToolCallStart(
       status: 'in_progress',
       ...(rawArgs !== undefined ? { rawInput: rawArgs } : {}),
       ...(filePath ? { locations: [{ path: filePath }] } : {}),
-      ...(inputText
-        ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: inputText } }] }
-        : {}),
     },
   });
 }
@@ -1517,13 +1512,7 @@ async function notifyToolCallEnd(
 ): Promise<void> {
   const args = parseToolArgs(rawArgs);
   const responseData = parseToolResponse(response);
-  const inputText = formatToolInputAsText(toolName, args);
-
-  const fullContent: acp.ToolCallContent[] = [];
-  if (inputText) {
-    fullContent.push({ type: 'content', content: { type: 'text', text: inputText } });
-  }
-  fullContent.push(...buildToolCallContentArray(toolName, args, responseData));
+  const content = buildToolCallContentArray(toolName, args, responseData);
 
   await cx.notify(acp.methods.client.session.update, {
     sessionId,
@@ -1531,7 +1520,7 @@ async function notifyToolCallEnd(
       sessionUpdate: 'tool_call_update',
       toolCallId,
       status: isToolFailed(toolName, responseData) ? 'failed' : 'completed',
-      ...(fullContent.length > 0 ? { content: fullContent } : {}),
+      ...(content.length > 0 ? { content } : {}),
     },
   });
 }
