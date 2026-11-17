@@ -52,6 +52,16 @@ function createMockRouter() {
       match: (url: string) => url.includes('/api/models'),
       handler: () => new Response('{"models":[]}', { status: 200 }),
     },
+    {
+      method: 'GET',
+      match: (url: string) => url.includes('/api/providers'),
+      handler: () => new Response('[]', { status: 200 }),
+    },
+    {
+      method: 'GET',
+      match: (url: string) => url.includes('/api/settings'),
+      handler: () => new Response('{}', { status: 200 }),
+    },
   ];
 
   const router = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -533,6 +543,59 @@ describe('AcpAgent', () => {
       id: 'task-1',
       updates: { provider: 'openai-compatible', model: 'gpt-5' },
     });
+  });
+
+  test('newSession advertises the model the agent profile runs, not the first offered', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([{ id: 'default', name: 'Default', provider: 'openai-compatible', model: 'deepseek' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({
+          models: [
+            { id: 'Idol', providerId: 'openai-compatible' },
+            { id: 'deepseek', providerId: 'openai-compatible' },
+            { id: 'hidden-model', providerId: 'openai-compatible', isHidden: true },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/providers', () =>
+      new Response(JSON.stringify([{ id: 'openai-compatible', name: 'Local' }]), { status: 200 }),
+    );
+    router.add('GET', '/api/settings', () =>
+      new Response(JSON.stringify({ preferredModels: ['openai-compatible/deepseek'] }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const response = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const modelOption = selectById(response.configOptions, 'model');
+    expect(modelOption.currentValue).toBe('openai-compatible/deepseek');
+    expect(modelOption.options).toEqual([
+      {
+        group: 'preferred',
+        name: 'Preferred',
+        options: [{ value: 'openai-compatible/deepseek', name: 'deepseek' }],
+      },
+      {
+        group: 'openai-compatible',
+        name: 'Local',
+        options: [{ value: 'openai-compatible/Idol', name: 'Idol' }],
+      },
+    ]);
   });
 
   test('prompt expands a custom command and streams it through run-prompt', async () => {

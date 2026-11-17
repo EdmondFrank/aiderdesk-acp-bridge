@@ -108,9 +108,73 @@ describe('buildConfigOptions', () => {
     expect(modelOption.category).toBe('model');
     expect(modelOption.currentValue).toBe('anthropic/claude-sonnet-4');
     expect(modelOption.options).toEqual([
-      { value: 'openai-compatible/gpt-5', name: 'openai-compatible/gpt-5' },
-      { value: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4' },
+      {
+        group: 'openai-compatible',
+        name: 'openai-compatible',
+        options: [{ value: 'openai-compatible/gpt-5', name: 'gpt-5' }],
+      },
+      {
+        group: 'anthropic',
+        name: 'anthropic',
+        options: [{ value: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4' }],
+      },
     ]);
+  });
+
+  test('orders preferred models first, names providers, and skips disabled ones', () => {
+    const models = [
+      { id: 'a', providerId: 'alpha' },
+      { id: 'b', providerId: 'alpha' },
+      { id: 'c', providerId: 'beta' },
+      { id: 'd', providerId: 'off' },
+    ];
+    const providers = [
+      { id: 'alpha', name: 'Alpha' },
+      { id: 'beta' },
+      { id: 'off', disabled: true },
+    ];
+    const options = buildConfigOptions(
+      BUILT_IN_MODES,
+      profiles,
+      'agent',
+      'default',
+      'guided',
+      models,
+      'alpha/a',
+      providers,
+      ['beta/c', 'alpha/b', 'off/d'],
+    );
+    const modelOption = selectById(options, 'model');
+    expect(modelOption.options).toEqual([
+      {
+        group: 'preferred',
+        name: 'Preferred',
+        options: [
+          { value: 'beta/c', name: 'c' },
+          { value: 'alpha/b', name: 'b' },
+        ],
+      },
+      {
+        group: 'alpha',
+        name: 'Alpha',
+        options: [{ value: 'alpha/a', name: 'a' }],
+      },
+    ]);
+    expect(modelOption.currentValue).toBe('alpha/a');
+  });
+
+  test('omits the model select when every model belongs to a disabled provider', () => {
+    const options = buildConfigOptions(
+      BUILT_IN_MODES,
+      profiles,
+      'agent',
+      'default',
+      'guided',
+      [{ id: 'a', providerId: 'off' }],
+      undefined,
+      [{ id: 'off', disabled: true }],
+    );
+    expect(options.map((o) => o.id)).toEqual(['chat_mode', 'agent_profile', 'autonomy_mode']);
   });
 
   test('defaults the model selection to the first model when none is current', () => {

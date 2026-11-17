@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   contextWindowFor,
+  effectiveModelId,
   estimateContextTokens,
   lastContextTokensFrom,
   parseComposedModelId,
@@ -77,6 +78,36 @@ describe('resolveContextModel', () => {
         session({ model: 'openai-compatible/gone', agentProfileId: 'bare', mainModel: 'openai/gone' }),
       ),
     ).toBeUndefined();
+  });
+});
+
+describe('effectiveModelId', () => {
+  test('prefers the session selection even when the server no longer lists it', () => {
+    expect(effectiveModelId(session({ model: 'openai-compatible/gone' }))).toBe('openai-compatible/gone');
+  });
+
+  test("shows the agent profile's model in agent modes", () => {
+    expect(effectiveModelId(session())).toBe('openai-compatible/gpt-5');
+  });
+
+  test("shows the project's main model in Aider modes", () => {
+    expect(
+      effectiveModelId(session({ mode: 'code', agentProfileId: undefined, mainModel: 'openrouter/vendor/model-a' })),
+    ).toBe('openrouter/vendor/model-a');
+  });
+
+  test('keeps a configured profile model the server no longer lists', () => {
+    expect(effectiveModelId(session({ models: [{ id: 'other', providerId: 'x' }] }))).toBe(
+      'openai-compatible/gpt-5',
+    );
+  });
+
+  test('falls back to the first offered model', () => {
+    expect(effectiveModelId(session({ agentProfileId: 'bare' }))).toBe('openai-compatible/gpt-5');
+  });
+
+  test('returns undefined when nothing is offered', () => {
+    expect(effectiveModelId(session({ models: [], agentProfileId: 'bare' }))).toBeUndefined();
   });
 });
 

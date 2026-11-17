@@ -49,6 +49,8 @@ export type ModelInfo = {
   name?: string;
   /** Context window in tokens; absent when the provider does not report one. */
   maxInputTokens?: number;
+  /** The server hides some offerings from its own picker (`isHidden`). */
+  isHidden?: boolean;
 };
 
 /**
@@ -63,7 +65,14 @@ export async function fetchProviderModels(host: string, port: number): Promise<M
     const data = response.data as { models?: unknown } | undefined;
     if (!data || !Array.isArray(data.models)) return [];
     return (data.models as ModelInfo[])
-      .filter((m) => m && typeof m.id === 'string' && typeof m.providerId === 'string')
+      .filter(
+        (m) =>
+          m &&
+          typeof m.id === 'string' &&
+          typeof m.providerId === 'string' &&
+          // Keep the advertised list aligned with the server's own picker.
+          m.isHidden !== true,
+      )
       .map((m) => ({
         id: m.id,
         providerId: m.providerId,
@@ -72,6 +81,60 @@ export async function fetchProviderModels(host: string, port: number): Promise<M
           ? { maxInputTokens: m.maxInputTokens }
           : {}),
       }));
+  } catch {
+    return [];
+  }
+}
+
+export type ProviderInfo = {
+  id: string;
+  /** Display name; AiderDesk leaves it blank for some providers. */
+  name?: string;
+  disabled?: boolean;
+};
+
+/**
+ * Fetch the configured LLM providers (`GET /api/providers`), so models can be
+ * grouped under a readable name and models of disabled providers are left out
+ * of the picker, exactly like AiderDesk's own model selector.
+ */
+export async function fetchProviders(host: string, port: number): Promise<ProviderInfo[]> {
+  try {
+    const response = await fetchJSON(host, port, '/api/providers', 'GET');
+    if (response.status !== 200) return [];
+    const providers = response.data as Array<{ id?: unknown; name?: unknown; disabled?: unknown }>;
+    if (!Array.isArray(providers)) return [];
+    const result: ProviderInfo[] = [];
+    for (const candidate of providers) {
+      const entry = candidate as { id?: unknown; name?: unknown; disabled?: unknown };
+      if (typeof entry?.id !== 'string' || entry.id.length === 0) continue;
+      result.push({
+        id: entry.id,
+        ...(typeof entry.name === 'string' && entry.name.trim() ? { name: entry.name.trim() } : {}),
+        ...(entry.disabled === true ? { disabled: true } : {}),
+      });
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch the user's preferred (starred) model ids from `GET /api/settings`.
+ *
+ * Only the ordering ids are read: the same response carries provider
+ * credentials, which are neither logged nor retained.
+ */
+export async function fetchPreferredModels(host: string, port: number): Promise<string[]> {
+  try {
+    const response = await fetchJSON(host, port, '/api/settings', 'GET');
+    if (response.status !== 200) return [];
+    const settings = response.data as { preferredModels?: unknown } | undefined;
+    if (!Array.isArray(settings?.preferredModels)) return [];
+    return settings.preferredModels.filter(
+      (id): id is string => typeof id === 'string' && id.length > 0,
+    );
   } catch {
     return [];
   }
@@ -177,6 +240,8 @@ export function buildConfigOptions(
   currentAutonomy: string,
   models: ModelInfo[] = [],
   currentModelId?: string,
+  providers: ProviderInfo[] = [],
+  preferredModelIds: string[] = [],
 ): acp.SessionConfigOption[] {
   const options: acp.SessionConfigOption[] = [
     {
@@ -223,18 +288,58 @@ export function buildConfigOptions(
     })),
   });
 
-  if (models.length > 0) {
+  // Models of disabled providers are not usable, and the server's own picker
+  // leaves them out too.
+  const offered = models.filter(
+    (model) => !providers.some((provider) => provider.disabled && provider.id === model.providerId),
+  );
+
+  if (offered.length > 0) {
     const composed = (m: ModelInfo) => `${m.providerId}/${m.id}`;
+    const offeredIds = new Set(offered.map(composed));
+    // AiderDesk's picker puts starred models first, then groups the rest by
+    // provider. Mirror that order so the first entries are the useful ones.
+    const preferred = preferredModelIds
+      .filter((id) => offeredIds.has(id))
+      .map((id) => offered.find((model) => composed(model) === id)!)
+      .filter((model, index, all) => all.indexOf(model) === index);
+    const preferredIds = new Set(preferred.map(composed));
+    const toOption = (m: ModelInfo): acp.SessionConfigSelectOption => ({
+      value: composed(m),
+      // AiderDesk names models by id alone; the provider is the group.
+      name: m.name ?? m.id,
+    });
+
+    const groups: acp.SessionConfigSelectGroup[] = [];
+    if (preferred.length > 0) {
+      groups.push({ group: 'preferred', name: 'Preferred', options: preferred.map(toOption) });
+    }
+    const buckets = new Map<string, ModelInfo[]>();
+    for (const model of offered) {
+      if (preferredIds.has(composed(model))) continue;
+      const bucket = buckets.get(model.providerId);
+      if (bucket) {
+        bucket.push(model);
+      } else {
+        buckets.set(model.providerId, [model]);
+      }
+    }
+    for (const [providerId, providerModels] of buckets) {
+      const providerName = providers.find((provider) => provider.id === providerId)?.name;
+      groups.push({
+        group: providerId,
+        name: providerName ?? providerId,
+        options: providerModels.map(toOption),
+      });
+    }
+
     options.push({
       type: 'select',
       id: 'model',
       name: 'Model',
       category: 'model',
-      currentValue: currentModelId ?? composed(models[0]!),
-      options: models.map((m) => ({
-        value: composed(m),
-        name: m.name ?? composed(m),
-      })),
+      currentValue: currentModelId ?? groups[0]?.options[0]?.value ?? composed(offered[0]!),
+      options: groups,
     });
   }
 

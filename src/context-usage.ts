@@ -78,6 +78,45 @@ export function resolveContextModel(session: {
 }
 
 /**
+ * The composed `provider/model` id to advertise as the session's current model.
+ *
+ * Same precedence as `resolveContextModel` — explicit selection, then the agent
+ * profile's model, then the project's `mainModel` — but a configured model is
+ * returned even when the server no longer lists it. A client header has to show
+ * the model the task would actually run; substituting the first offered model
+ * would name an unrelated one. The offered list only supplies the last-resort
+ * fallback.
+ */
+export function effectiveModelId(session: {
+  models: ModelInfo[];
+  model?: string;
+  mode: string;
+  agentProfileId?: string;
+  agentProfiles: AgentProfileInfo[];
+  mainModel?: string;
+}): string | undefined {
+  if (session.model) {
+    return session.model;
+  }
+
+  if (!AIDER_MODES.includes(session.mode)) {
+    const profile =
+      session.agentProfiles.find((candidate) => candidate.id === session.agentProfileId) ??
+      session.agentProfiles.find((candidate) => candidate.provider && candidate.model);
+    if (profile?.provider && profile.model) {
+      return `${profile.provider}/${profile.model}`;
+    }
+  }
+
+  if (session.mainModel) {
+    return session.mainModel;
+  }
+
+  const first = session.models[0];
+  return first ? `${first.providerId}/${first.id}` : undefined;
+}
+
+/**
  * Context window of the session's effective model, or `0` when it is unknown
  * (provider without `maxInputTokens`, or a model the server no longer lists).
  */

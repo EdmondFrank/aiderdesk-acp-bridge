@@ -51,15 +51,23 @@ import {
   buildModeState,
   fetchAgentProfiles,
   fetchCustomModes,
+  fetchPreferredModels,
   fetchProjectSettings,
   fetchProviderModels,
+  fetchProviders,
   getAllModes,
   isAgentProfileVisible,
   resolveDefaultProfileId,
   type AgentProfileInfo,
   type ModelInfo,
+  type ProviderInfo,
 } from './modes';
-import { contextWindowFor, estimateContextTokens, lastContextTokensFrom } from './context-usage';
+import {
+  contextWindowFor,
+  effectiveModelId,
+  estimateContextTokens,
+  lastContextTokensFrom,
+} from './context-usage';
 import {
   buildStandingPromptStub,
   clearStandingPrompt,
@@ -154,6 +162,10 @@ export type AcpSession = {
   allModes: ModeOption[];
   agentProfiles: AgentProfileInfo[];
   models: ModelInfo[];
+  /** Configured providers, for readable model groups and disabled filtering. */
+  providers: ProviderInfo[];
+  /** Starred model ids, advertised first like AiderDesk's own picker. */
+  preferredModelIds: string[];
   model?: string;
   /** Project's Aider `mainModel`, so a fresh session can size its context window. */
   mainModel?: string;
@@ -312,15 +324,7 @@ export class AcpAgent {
       await rememberSessionTask(sessionId, taskId, cwd);
     }
 
-    const configOptions = buildConfigOptions(
-      session.allModes,
-      session.agentProfiles,
-      session.mode,
-      session.agentProfileId,
-      session.autonomyMode,
-      session.models,
-      session.model,
-    );
+    const configOptions = sessionConfigOptions(session);
 
     this.advertiseCommands(session, sessionId, cx);
 
@@ -419,18 +423,21 @@ export class AcpAgent {
 
   /**
    * Build a fresh AcpSession for the given working directory, fetching agent
-   * profiles, custom modes, the project default profile, provider models and
-   * slash commands. `taskId` is the server task the session is bound to (its
-   * ACP session id).
+   * profiles, custom modes, the project default profile, provider models,
+   * providers, preferred models and slash commands. `taskId` is the server task
+   * the session is bound to (its ACP session id).
    */
   private async createSession(cwd: string, taskId: string | undefined): Promise<AcpSession> {
-    const [agentProfiles, customModes, projectSettings, commands, models] = await Promise.all([
-      fetchAgentProfiles(this.host, this.port),
-      fetchCustomModes(this.host, this.port, cwd),
-      fetchProjectSettings(this.host, this.port, cwd),
-      fetchCommands(this.host, this.port, cwd),
-      fetchProviderModels(this.host, this.port),
-    ]);
+    const [agentProfiles, customModes, projectSettings, commands, models, providers, preferredModelIds] =
+      await Promise.all([
+        fetchAgentProfiles(this.host, this.port),
+        fetchCustomModes(this.host, this.port, cwd),
+        fetchProjectSettings(this.host, this.port, cwd),
+        fetchCommands(this.host, this.port, cwd),
+        fetchProviderModels(this.host, this.port),
+        fetchProviders(this.host, this.port),
+        fetchPreferredModels(this.host, this.port),
+      ]);
     const allModes = getAllModes(customModes);
     const defaultProfileId = resolveDefaultProfileId(
       agentProfiles,
@@ -447,6 +454,8 @@ export class AcpAgent {
       allModes,
       agentProfiles,
       models,
+      providers,
+      preferredModelIds,
       ...(projectSettings.mainModel ? { mainModel: projectSettings.mainModel } : {}),
       commands,
       usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
@@ -533,15 +542,7 @@ export class AcpAgent {
       }
     }
 
-    const configOptions = buildConfigOptions(
-      session.allModes,
-      session.agentProfiles,
-      session.mode,
-      session.agentProfileId,
-      session.autonomyMode,
-      session.models,
-      session.model,
-    );
+    const configOptions = sessionConfigOptions(session);
 
     // A different model, profile or mode can mean a different context window,
     // so republish it as soon as the client switches (pi-acp does the same).
@@ -660,15 +661,7 @@ export class AcpAgent {
 
     return {
       modes: buildModeState(session.allModes, session.mode),
-      configOptions: buildConfigOptions(
-        session.allModes,
-        session.agentProfiles,
-        session.mode,
-        session.agentProfileId,
-        session.autonomyMode,
-        session.models,
-        session.model,
-      ),
+      configOptions: sessionConfigOptions(session),
     };
   }
 
@@ -723,15 +716,7 @@ export class AcpAgent {
 
     return {
       modes: buildModeState(session.allModes, session.mode),
-      configOptions: buildConfigOptions(
-        session.allModes,
-        session.agentProfiles,
-        session.mode,
-        session.agentProfileId,
-        session.autonomyMode,
-        session.models,
-        session.model,
-      ),
+      configOptions: sessionConfigOptions(session),
     };
   }
 
@@ -1599,6 +1584,28 @@ function applyTaskSettings(session: AcpSession, task: TaskSummary | undefined): 
       session.model = composed;
     }
   }
+}
+
+/**
+ * Advertise a session's config options, with the model it actually runs.
+ *
+ * `session.model` only holds an explicit ACP or task selection. Without one the
+ * server resolves the model from the agent profile (agent modes) or the
+ * project's `mainModel` (Aider modes), so the option has to report that rather
+ * than the first offered model.
+ */
+function sessionConfigOptions(session: AcpSession): acp.SessionConfigOption[] {
+  return buildConfigOptions(
+    session.allModes,
+    session.agentProfiles,
+    session.mode,
+    session.agentProfileId,
+    session.autonomyMode,
+    session.models,
+    effectiveModelId(session),
+    session.providers,
+    session.preferredModelIds,
+  );
 }
 
 /** Announce a task's title so a client shows the session name it restored. */

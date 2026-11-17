@@ -20,7 +20,7 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   renders per its restore verbosity, and `session/load`/`session/resume` adopt the
   task's own title, mode, profile and model); `session/resume` only asks the
   server to continue a task it left `IN_PROGRESS`/`INTERRUPTED`
-- Mode / agent-profile / autonomy / model configuration surfaced as ACP session config options (model changes persist to the task via the REST API)
+- Mode / agent-profile / autonomy / model configuration surfaced as ACP session config options (model changes persist to the task via the REST API). The model picker mirrors AiderDesk's own selector — starred models first under `Preferred`, then one group per provider under its display name, with hidden models and the models of disabled providers left out — and its current value is the model the task actually runs (explicit selection, the agent profile's model, or the project's `mainModel`), not the first offered one
 - Slash commands: custom commands (`~/.aider-desk/commands/` and
   `<project>/.aider-desk/commands/`) are advertised to ACP clients and executed
   with argument substitution and `!shell` support; built-in session-control
