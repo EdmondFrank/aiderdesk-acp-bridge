@@ -1980,4 +1980,158 @@ describe('AcpAgent', () => {
       delete process.env.AIDER_DESK_ACP_AUTO_ANSWER;
     }
   });
+
+  test('usage_update carries the context window of the model the turn ran on', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([{ id: 'default', name: 'Default', provider: 'openai-compatible', model: 'ctx-model' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () =>
+      new Response(JSON.stringify({ agentProfileId: 'default' }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({
+          // The agent profile's model runs with a known window; the other one
+          // reports none, so a session switched to it has no window to show.
+          models: [
+            { id: 'ctx-model', providerId: 'openai-compatible', maxInputTokens: 262144 },
+            { id: 'unknown-model', providerId: 'openai-compatible' },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'response-completed',
+            data: { messageId: 'm1', usageReport: { sentTokens: 100, receivedTokens: 20, cacheReadTokens: 900 } },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
+
+    const usageUpdates = notifyCalls
+      .filter((call) => call.method === acp.methods.client.session.update)
+      .map((call) => (call.params as { update: { sessionUpdate: string; used?: number; size?: number } }).update)
+      .filter((update) => update.sessionUpdate === 'usage_update');
+
+    // `used` is the turn's whole prompt (sent + received + cache read) and
+    // `size` the model's window, which is what a client header renders.
+    expect(usageUpdates.at(-1)).toEqual({ sessionUpdate: 'usage_update', used: 1020, size: 262144 });
+  });
+
+  test('switching model republishes the context window', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([{ id: 'default', name: 'Default', provider: 'openai-compatible', model: 'ctx-model' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({
+          models: [
+            { id: 'ctx-model', providerId: 'openai-compatible', maxInputTokens: 262144 },
+            { id: 'big-model', providerId: 'openai-compatible', maxInputTokens: 1000000 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', /\/api\/project\/tasks$/, () => new Response('{}', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    await agent.setConfigOption({
+      sessionId: session.sessionId,
+      configId: 'model',
+      value: 'openai-compatible/big-model',
+    });
+
+    const sizes = notifyCalls
+      .filter((call) => call.method === acp.methods.client.session.update)
+      .map((call) => (call.params as { update: { sessionUpdate: string; size?: number } }).update)
+      .filter((update) => update.sessionUpdate === 'usage_update')
+      .map((update) => update.size);
+
+    expect(sizes.at(-1)).toBe(1000000);
+  });
+
+  test('session/load seeds context usage from the stored conversation', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({ models: [{ id: 'ctx-model', providerId: 'openai-compatible', maxInputTokens: 200000 }] }),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(
+        JSON.stringify([
+          { id: 'task-9', baseDir: '/proj', name: 'Loaded', provider: 'openai-compatible', model: 'ctx-model' },
+        ]),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/tasks/load', () =>
+      new Response(
+        JSON.stringify({
+          messages: [
+            { type: 'user', id: 'u1', content: 'hello' },
+            {
+              type: 'response-completed',
+              messageId: 'r1',
+              content: 'world',
+              usageReport: { sentTokens: 1000, receivedTokens: 50, cacheReadTokens: 2000 },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    await agent.loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+
+    const usageUpdate = notifyCalls
+      .map((call) => (call.params as { update?: { sessionUpdate?: string; used?: number; size?: number } })?.update)
+      .find((update) => update?.sessionUpdate === 'usage_update');
+
+    expect(usageUpdate).toEqual({ sessionUpdate: 'usage_update', used: 3050, size: 200000 });
+  });
 });

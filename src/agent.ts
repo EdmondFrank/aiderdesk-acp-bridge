@@ -51,7 +51,7 @@ import {
   buildModeState,
   fetchAgentProfiles,
   fetchCustomModes,
-  fetchDefaultAgentProfileId,
+  fetchProjectSettings,
   fetchProviderModels,
   getAllModes,
   isAgentProfileVisible,
@@ -59,6 +59,7 @@ import {
   type AgentProfileInfo,
   type ModelInfo,
 } from './modes';
+import { contextWindowFor, lastContextTokensFrom } from './context-usage';
 import {
   buildStandingPromptStub,
   clearStandingPrompt,
@@ -155,6 +156,8 @@ export type AcpSession = {
   agentProfiles: AgentProfileInfo[];
   models: ModelInfo[];
   model?: string;
+  /** Project's Aider `mainModel`, so a fresh session can size its context window. */
+  mainModel?: string;
   commands: CommandsData;
   usage: AcpSessionUsage;
   /** Set once the first user prompt went through; only that one is deduped. */
@@ -249,6 +252,11 @@ const REPLAY_TAIL_MESSAGES = 20;
 export class AcpAgent {
   private readonly sessions = new Map<string, AcpSession>();
   private lastAgentProfileId?: string;
+  /**
+   * Most recent request context, kept so `setConfigOption` (which ACP calls
+   * without one) can publish usage through the same connection.
+   */
+  private clientContext?: acp.AgentContext;
 
   constructor(
     private readonly host: string,
@@ -283,6 +291,7 @@ export class AcpAgent {
   async newSession(params: acp.NewSessionRequest, cx: acp.AgentContext): Promise<acp.NewSessionResponse> {
     const cwd = params.cwd ?? '';
     const standingPrompt = extractStandingPrompt(params);
+    this.clientContext = cx;
 
     // Create the backing AiderDesk task eagerly so the ACP session id can be
     // the server's persistent task id. That makes sessions show up in
@@ -331,11 +340,58 @@ export class AcpAgent {
       }, 0);
     }
 
+    // Publish the context window once the client knows the session, so its
+    // header can show `used/size` before the first turn. Deferred for the same
+    // reason as the command advert above.
+    setTimeout(() => {
+      void this.publishContextUsage(session, sessionId, cx).catch(() => {
+        // best-effort: the client may not render usage updates
+      });
+    }, 0);
+
     return {
       sessionId,
       configOptions,
       modes: buildModeState(session.allModes, session.mode),
     };
+  }
+
+  /**
+   * Publish the session's context-window occupancy as an ACP `usage_update`.
+   *
+   * `used` is the whole prompt of the last turn (`sent + received + cache
+   * read`, the total the server itself uses for its compaction threshold) and
+   * `size` is the effective model's context window, resolved the way the server
+   * picks the model. Clients render this as `used/size (%)` in their header,
+   * exactly as they do for Pi, whose adapter publishes the same message.
+   *
+   * Nothing is published when the window is unknown (a provider that reports
+   * no `maxInputTokens`, or a model the server no longer lists): `size: 0`
+   * would only hide the indicator a client could otherwise show. With
+   * `requireKnownUsed`, a session whose context size was never observed (a
+   * reconnect to an old task) is skipped rather than reported as empty.
+   */
+  private async publishContextUsage(
+    session: AcpSession,
+    sessionId: string,
+    cx: acp.AgentContext,
+    options?: { requireKnownUsed?: boolean },
+  ): Promise<void> {
+    const size = contextWindowFor(session);
+    if (size <= 0) {
+      return;
+    }
+    if (options?.requireKnownUsed && session.lastContextTokens === undefined) {
+      return;
+    }
+    await cx.notify(acp.methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: 'usage_update',
+        used: session.lastContextTokens ?? 0,
+        size,
+      },
+    });
   }
 
   /**
@@ -379,15 +435,19 @@ export class AcpAgent {
    * ACP session id).
    */
   private async createSession(cwd: string, taskId: string | undefined): Promise<AcpSession> {
-    const [agentProfiles, customModes, projectDefaultProfileId, commands, models] = await Promise.all([
+    const [agentProfiles, customModes, projectSettings, commands, models] = await Promise.all([
       fetchAgentProfiles(this.host, this.port),
       fetchCustomModes(this.host, this.port, cwd),
-      fetchDefaultAgentProfileId(this.host, this.port, cwd),
+      fetchProjectSettings(this.host, this.port, cwd),
       fetchCommands(this.host, this.port, cwd),
       fetchProviderModels(this.host, this.port),
     ]);
     const allModes = getAllModes(customModes);
-    const defaultProfileId = resolveDefaultProfileId(agentProfiles, projectDefaultProfileId, this.lastAgentProfileId);
+    const defaultProfileId = resolveDefaultProfileId(
+      agentProfiles,
+      projectSettings.agentProfileId,
+      this.lastAgentProfileId,
+    );
 
     return {
       cwd,
@@ -398,6 +458,7 @@ export class AcpAgent {
       allModes,
       agentProfiles,
       models,
+      ...(projectSettings.mainModel ? { mainModel: projectSettings.mainModel } : {}),
       commands,
       usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     };
@@ -464,6 +525,16 @@ export class AcpAgent {
       session.model,
     );
 
+    // A different model, profile or mode can mean a different context window,
+    // so republish it as soon as the client switches (pi-acp does the same).
+    if (this.clientContext && ['model', 'agent_profile', 'chat_mode'].includes(String(params.configId))) {
+      try {
+        await this.publishContextUsage(session, params.sessionId, this.clientContext);
+      } catch {
+        // best-effort: a failed usage update must not fail the config change
+      }
+    }
+
     return { configOptions };
   }
 
@@ -511,6 +582,7 @@ export class AcpAgent {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
     const standingPrompt = extractStandingPrompt(params);
+    this.clientContext = cx;
 
     let session = this.sessions.get(sessionId);
     if (!session) {
@@ -547,9 +619,22 @@ export class AcpAgent {
         mode === 'tail' ? state.messages.slice(-REPLAY_TAIL_MESSAGES) : state.messages,
         cx,
       );
+      // Seed the context figure from the conversation's last stored turn so the
+      // header shows the window a reloaded session already occupies.
+      const lastContext = lastContextTokensFrom(state.messages);
+      if (lastContext !== undefined) {
+        session.lastContextTokens = lastContext;
+      }
     }
 
     await rememberSessionTask(sessionId, taskId, projectDir);
+
+    // With replay off the conversation was never read, so the context figure is
+    // only known when this process already ran a turn for the session; an empty
+    // task (no stored turn) legitimately reports zero.
+    await this.publishContextUsage(session, sessionId, cx, { requireKnownUsed: mode === 'off' }).catch(() => {
+      // best-effort: a failed usage update must not fail the load
+    });
 
     return {
       modes: buildModeState(session.allModes, session.mode),
@@ -575,6 +660,7 @@ export class AcpAgent {
     const sessionId = params.sessionId;
     const cwd = params.cwd ?? '';
     const standingPrompt = extractStandingPrompt(params);
+    this.clientContext = cx;
 
     let session = this.sessions.get(sessionId);
     if (!session) {
@@ -602,6 +688,12 @@ export class AcpAgent {
     if (shouldResumeTask(task)) {
       await resumeTask(this.host, this.port, projectDir, taskId);
     }
+
+    // `session/resume` carries no replay, so the context figure is only known
+    // when this process already ran a turn for the session.
+    await this.publishContextUsage(session, sessionId, cx, { requireKnownUsed: true }).catch(() => {
+      // best-effort: a failed usage update must not fail the resume
+    });
 
     return {
       modes: buildModeState(session.allModes, session.mode),
@@ -637,6 +729,7 @@ export class AcpAgent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.clientContext = cx;
 
     const abortController = new AbortController();
     session.abortController = abortController;
@@ -1236,14 +1329,17 @@ async function relaySse(
           session.usage.cachedWriteTokens += usage.cacheWriteTokens ?? 0;
           // Same total the server uses for its compaction threshold: the whole
           // prompt of this turn, cached prefix included.
-          session.lastContextTokens =
-            (usage.sentTokens ?? 0) + (usage.receivedTokens ?? 0) + (usage.cacheReadTokens ?? 0);
+          const used = (usage.sentTokens ?? 0) + (usage.receivedTokens ?? 0) + (usage.cacheReadTokens ?? 0);
+          session.lastContextTokens = used;
           await cx.notify(acp.methods.client.session.update, {
             sessionId,
             update: {
               sessionUpdate: 'usage_update',
-              used: (usage.sentTokens ?? 0) + (usage.receivedTokens ?? 0) + (usage.cacheReadTokens ?? 0),
-              size: 0,
+              used,
+              // Context window of the model this turn ran on, so the client can
+              // render `used/size (%)` instead of nothing. 0 when the provider
+              // reports no window; the cost below is reported either way.
+              size: contextWindowFor(session),
               ...(usage.agentTotalCost !== undefined ? { cost: { amount: usage.agentTotalCost, currency: 'USD' } } : {}),
             },
           });

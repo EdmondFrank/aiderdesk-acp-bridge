@@ -286,6 +286,13 @@ export type TaskStateMessage = {
   args?: unknown;
   response?: string;
   finished?: boolean;
+  /** Present on messages that ran a model turn; seeds context usage on load. */
+  usageReport?: {
+    sentTokens?: number;
+    receivedTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
 };
 
 /** Full state of a task (conversation messages) via `POST /api/project/tasks/load`. */

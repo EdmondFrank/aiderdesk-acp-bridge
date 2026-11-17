@@ -23,7 +23,9 @@ Two directions of translation — keep both sides in mind when changing code:
 2. **AiderDesk out → ACP out**: AiderDesk SSE events become ACP `session/update`
    notifications (`agent_thought_chunk`, `agent_message_chunk`, `tool_call`,
    `tool_call_update`, `usage_update`, `session_info_update`,
-   `user_message_chunk`, `available_commands_update`).
+   `user_message_chunk`, `available_commands_update`). `usage_update` carries the
+   effective model's context window (`size`) next to the turn's prompt tokens
+   (`used`), so clients render `used/size (%)` as they do for Pi.
 
 The README's protocol overview and slash-command tables must stay accurate when behavior
 changes.
@@ -47,7 +49,7 @@ versions exist and must not be confused:
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 216 tests across 12 files
+bun test            # bun:test suite — 231 tests across 13 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -65,7 +67,8 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 | `src/commands.ts` | Slash-command support: `fetchCommands` (`GET /api/project/commands`), command normalization/lookup, `BUILT_IN_COMMANDS` (`/new`, `/compact`, `/smart-compact`, `/handoff` + alias `/hand-off`, `/tasks`, `/load`), `parseCommandText`, argument substitution (`{{1}}`, `{{2}}`, `{{ARGUMENTS}}`), `!shell` line execution, template expansion. |
 | `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `listTasksStrict`, `loadTaskStrict`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `updateTaskFields`, `answerQuestion`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers; the `…Strict` variants distinguish "request failed" from "empty/missing", which is what `session/load` needs. |
 | `src/session-policy.ts` | Per-project session state that must outlive the process: `writeStandingPrompt`/`clearStandingPrompt` (the ACP standing prompt as `<project>/.aider-desk/rules/raft-standing-prompt.md`, which AiderDesk renders into the system prompt) and the session-id → task-id map (`rememberSessionTask`, `resolveSessionTask`, `forgetSessionTask`) persisted under `$AIDER_DESK_ACP_STATE_DIR` (default `~/.local/state/aiderdesk-acp`). |
-| `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project default profile/provider models (`fetchProviderModels`, `GET /api/models`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
+| `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project settings/provider models (`fetchAgentProfiles` keeps each profile's `provider`/`model`, `fetchProviderModels` keeps `maxInputTokens`, `fetchProjectSettings` returns the default profile + `mainModel`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
+| `src/context-usage.ts` | Context-window resolution for `usage_update`: `resolveContextModel` (session selection → agent profile's model → project `mainModel`, ignoring models the server no longer lists), `contextWindowFor`, `parseComposedModelId`, `lastContextTokensFrom` (seeds `used` when a loaded conversation is replayed). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
 | `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle`, `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
 | `src/constants.ts` | Host/port defaults, env port resolution, built-in modes, `AIDER_MODES`, autonomy modes, default mode/autonomy. |
@@ -136,6 +139,14 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   `available_commands_update` notification is deferred with `setTimeout(0)` so the
   `session/new` response is written first — keep that ordering (a notification
   referencing an unknown session id is dropped by the client).
+- **Context usage is published proactively too.** Besides the per-turn relay,
+  `publishContextUsage` fires after `session/new` (deferred like the command
+  advert), after `session/load` (seeded from the last stored `usageReport`), after
+  `session/resume` (only when this process already saw a turn) and on
+  `model`/`agent_profile`/`chat_mode` changes. It stays silent when the window is
+  unknown (`maxInputTokens` absent, or a model the server no longer lists) — a
+  `size: 0` update would only hide a client's indicator. `setConfigOption` has no
+  `AgentContext` parameter, so the agent keeps the last one in `clientContext`.
 - **Built-in commands cannot be shadowed** — they resolve before project
   custom/extension commands.
 - **Custom command limitations**: `includeContext: false` and `skills` frontmatter
@@ -210,8 +221,8 @@ underlying task while the ACP client keeps resuming by session id.
 ## Testing
 
 - `bun test`. Suites live next to behavior: `agent.test.ts`, `commands.test.ts`,
-  `http.test.ts`, `modes.test.ts`, `sse.test.ts`, `tools.test.ts`,
-  `session-policy.test.ts`, `raft-policy.test.ts`.
+  `context-usage.test.ts`, `http.test.ts`, `modes.test.ts`, `sse.test.ts`,
+  `tools.test.ts`, `session-policy.test.ts`, `raft-policy.test.ts`.
 - `agent.test.ts` points `AIDER_DESK_ACP_STATE_DIR` at a temp directory at import
   time, so session mappings never touch the real user state file. Keep that line
   when reordering imports.

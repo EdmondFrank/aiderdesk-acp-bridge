@@ -30,6 +30,11 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   session info, cancellation — including `agent_thought_chunk`, `agent_message_chunk`,
   `tool_call`, `tool_call_update`, `usage_update` and `available_commands_update` notifications;
   `session/prompt` responses carry session-cumulative token usage (ACP experimental `usage`)
+- Context window reporting: `usage_update` carries the effective model's context
+  window (`size`, resolved from the selected model, the agent profile's model or the
+  project's `mainModel`) next to the last turn's prompt tokens (`used`), and is
+  published when a session is created or reloaded and whenever the model changes —
+  so an ACP client's header shows `used/size` just as it does for Pi
 - Standing prompts for clients that own the system prompt: `_meta.systemPromptOverride`
   becomes `<project>/.aider-desk/rules/raft-standing-prompt.md`, so AiderDesk renders it
   into the system prompt instead of the conversation history. Session-id → task-id
