@@ -28,12 +28,26 @@ Two directions of translation — keep both sides in mind when changing code:
 The README's protocol overview and slash-command tables must stay accurate when behavior
 changes.
 
+## Versioning
+
+Bump `version` in `package.json` in the same commit as any behavior change — it is the
+single source for both `--version`/`-v` and the ACP `initialize` response (read from
+`../package.json`), and clients log it when they negotiate the connection. Semver by
+intent: patch for fixes and docs, minor for new ACP methods, config options, env vars or
+command behavior, major when an existing client-visible contract changes. Two independent
+versions exist and must not be confused:
+
+- `package.json` — the bridge.
+- `raft-shim/raft-policy/index.ts` — the Raft extension; `raft-shim/install.sh` installs it
+  into a version-named path, so **reinstalling the same version keeps running the old copy**.
+  Bump it whenever the policy changes.
+
 ## Commands
 
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 180 tests across 9 files
+bun test            # bun:test suite — 216 tests across 12 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
