@@ -49,7 +49,7 @@ versions exist and must not be confused:
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 239 tests across 13 files
+bun test            # bun:test suite — 243 tests across 13 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -70,7 +70,7 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 | `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project settings/provider models (`fetchAgentProfiles` keeps each profile's `provider`/`model`, `fetchProviderModels` keeps `maxInputTokens`, `fetchProjectSettings` returns the default profile + `mainModel`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
 | `src/context-usage.ts` | Context-window resolution for `usage_update`: `resolveContextModel` (session selection → agent profile's model → project `mainModel`, ignoring models the server no longer lists), `contextWindowFor`, `parseComposedModelId`, `lastContextTokensFrom` (seeds `used` when a loaded conversation is replayed), `estimateContextTokens` (the figure a compaction leaves behind, which no turn measures). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
-| `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle`, `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
+| `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle` (with `summarizeToolArgs` giving every unnamed tool a parameter-bearing title), `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
 | `src/constants.ts` | Host/port defaults, env port resolution, built-in modes, `AIDER_MODES`, autonomy modes, default mode/autonomy. |
 | `raft-shim/` | Raft adapter: `aiderdesk.ts` proxies Raft's Grok ACP driver onto the bridge, `raft-policy/` holds an AiderDesk extension that elides stale tool results for long-lived agent tasks (own `tsconfig.json`, excluded from the bridge typecheck). |
 | `test/*.test.ts` | `bun:test` suites. `test/helpers.ts` exports `selectById` for asserting on config options. |

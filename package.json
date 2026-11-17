@@ -1,6 +1,6 @@
 {
   "name": "aiderdesk-acp-bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Standalone ACP (Agent Client Protocol) bridge for AiderDesk, powered by Bun",
   "type": "module",
   "module": "src/index.ts",

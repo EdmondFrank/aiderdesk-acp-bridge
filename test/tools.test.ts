@@ -87,6 +87,36 @@ describe('formatToolTitle', () => {
     const title = formatToolTitle('bash', { command: 'x'.repeat(200) });
     expect(title.endsWith('...')).toBe(true);
   });
+
+  test("titles AiderDesk's own tool names", () => {
+    expect(formatToolTitle('read_file', { file_path: '/a/b.ts' })).toBe('Read: /a/b.ts');
+    expect(formatToolTitle('edit_block', { file_path: '/a/b.ts', old_string: 'x' })).toBe('Edit: /a/b.ts');
+    expect(formatToolTitle('write_file', { file_path: '/a/b.ts' })).toBe('Write: /a/b.ts');
+    expect(formatToolTitle('search_files', { path: '/a', query: 'tool call params' })).toBe(
+      'Search: tool call params',
+    );
+    expect(formatToolTitle('execute_command', { command: 'rtk git status' })).toBe('Bash: rtk git status');
+  });
+
+  test('derives a title from the arguments of tools it has no case for', () => {
+    expect(formatToolTitle('desktop.read_file', { path: '/a/b.ts' })).toBe('Desktop.read_file: /a/b.ts');
+    expect(formatToolTitle('code_mode', { code: 'local r = 1\nprint(r)' })).toBe('Code_mode: local r = 1');
+    expect(formatToolTitle('update_item_completion', { name: 'step one', completed: true })).toBe(
+      'Update_item_completion: step one',
+    );
+  });
+
+  test('falls back to the tool name when no argument says anything', () => {
+    expect(formatToolTitle('todo.set_items', { items: [] })).toBe('Todo.set_items');
+    expect(formatToolTitle('todo.get_items', {})).toBe('Todo.get_items');
+  });
+
+  test('keeps a derived title on one shortened line', () => {
+    const title = formatToolTitle('code_mode', { code: `local x = "${'y'.repeat(200)}"` });
+    expect(title.startsWith('Code_mode: local x = "')).toBe(true);
+    expect(title.includes('\n')).toBe(false);
+    expect(title.endsWith('...')).toBe(true);
+  });
 });
 
 describe('parseToolResponse & isToolFailed', () => {
