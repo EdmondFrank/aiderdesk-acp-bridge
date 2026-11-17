@@ -1178,7 +1178,16 @@ describe('AcpAgent', () => {
     const updates = notifyCalls
       .filter((c) => c.method === acp.methods.client.session.update)
       .map((c) => (c.params as { update: { sessionUpdate: string } }).update.sessionUpdate);
-    expect(updates).toEqual(['user_message_chunk', 'agent_thought_chunk', 'agent_message_chunk', 'tool_call_update']);
+    // The task's title is announced first, then the conversation; a replayed
+    // tool call sends the `tool_call` that carries its name before the result.
+    expect(updates).toEqual([
+      'session_info_update',
+      'user_message_chunk',
+      'agent_thought_chunk',
+      'agent_message_chunk',
+      'tool_call',
+      'tool_call_update',
+    ]);
 
     // The loaded session is bound to the task: the next prompt targets it.
     await agent.prompt({ sessionId: 'task-9', prompt: [{ type: 'text', text: 'continue' }] }, cx);
@@ -1194,7 +1203,10 @@ describe('AcpAgent', () => {
       new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
     );
     router.add('GET', '/api/project/tasks', () =>
-      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Resumed' }]), { status: 200 }),
+      new Response(
+        JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Resumed', state: 'IN_PROGRESS' }]),
+        { status: 200 },
+      ),
     );
     let seenBody: Record<string, unknown> | undefined;
     router.add('POST', '/api/project/resume-task', (call) => {
@@ -1208,6 +1220,122 @@ describe('AcpAgent', () => {
     await agent.resumeSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
 
     expect(seenBody).toEqual({ projectDir: '/proj', taskId: 'task-9' });
+  });
+
+  test('session/load adopts the task settings and title, not the project defaults', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([
+          { id: 'default', name: 'Power Tools' },
+          { id: 'writer', name: 'Test Writer' },
+        ]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () => new Response('{"agentProfileId":"default"}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({
+          models: [
+            { id: 'default-model', providerId: 'openai-compatible', name: 'Default' },
+            { id: 'task-model', providerId: 'openai-compatible', name: 'Task' },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(
+        JSON.stringify([
+          {
+            id: 'task-9',
+            baseDir: '/proj',
+            name: 'Restored task',
+            agentProfileId: 'writer',
+            autonomyMode: 'autonomous',
+            provider: 'openai-compatible',
+            model: 'task-model',
+            currentMode: 'agent',
+          },
+        ]),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/tasks/load', () => new Response(JSON.stringify({ messages: [] }), { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const response = await agent.loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+
+    const configOptions = response.configOptions ?? [];
+    expect(selectById(configOptions, 'agent_profile').currentValue).toBe('writer');
+    expect(selectById(configOptions, 'autonomy_mode').currentValue).toBe('autonomous');
+    expect(selectById(configOptions, 'model').currentValue).toBe('openai-compatible/task-model');
+
+    const titleUpdate = notifyCalls
+      .map((c) => c.params as { update?: { sessionUpdate?: string; title?: string } })
+      .find((p) => p.update?.sessionUpdate === 'session_info_update');
+    expect(titleUpdate?.update?.title).toBe('Restored task');
+  });
+
+  test('session/resume does not re-run a task that is idle', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(
+        JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Idle', state: 'READY_FOR_REVIEW' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/resume-task', () => new Response('{}', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const response = await agent.resumeSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+
+    expect(response.modes?.currentModeId).toBe('agent');
+    expect(router.callsMatching(/resume-task/)).toHaveLength(0);
+  });
+
+  test('session/resume re-runs an idle task when AIDER_DESK_ACP_RESUME_TASK forces it', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(
+        JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Idle', state: 'READY_FOR_REVIEW' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/resume-task', () => new Response('{}', { status: 200 }));
+    globalThis.fetch = router.router as typeof fetch;
+
+    process.env.AIDER_DESK_ACP_RESUME_TASK = '1';
+    try {
+      const agent = new AcpAgent('localhost', 24337);
+      const { cx } = mockContext();
+      await agent.resumeSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+
+      expect(router.callsMatching(/resume-task/)).toHaveLength(1);
+    } finally {
+      delete process.env.AIDER_DESK_ACP_RESUME_TASK;
+    }
   });
 
   test('session/delete removes the session and deletes its task', async () => {
@@ -1424,7 +1552,9 @@ describe('AcpAgent', () => {
       const { cx, notifyCalls } = mockContext();
       await agent.loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
 
-      const replayed = notifyCalls.filter((c) => c.method === acp.methods.client.session.update);
+      const replayed = notifyCalls
+        .filter((c) => c.method === acp.methods.client.session.update)
+        .filter((c) => (c.params as { update: { sessionUpdate: string } }).update.sessionUpdate !== 'session_info_update');
       expect(replayed).toHaveLength(20);
     } finally {
       delete process.env.AIDER_DESK_ACP_REPLAY;

@@ -15,6 +15,7 @@ import {
 } from './commands';
 import { contextCharsOf, evaluateCompaction } from './compaction-report';
 import {
+  AUTONOMY_MODES,
   DEDUPE_STANDING_PROMPT,
   DEFAULT_AUTONOMY_MODE,
   DEFAULT_MODE,
@@ -502,8 +503,9 @@ export class AcpAgent {
   /**
    * Load an existing task into this process as an ACP session (`session/load`).
    * The session id is the server task id, so loading from a fresh process just
-   * creates a session bound to that task. The stored conversation is replayed
-   * to the client as session updates so it can render the restored history.
+   * creates a session bound to that task. The session adopts the task's own
+   * profile/model/mode and title, then the stored conversation is replayed to
+   * the client as session updates so it can render the restored history.
    */
   async loadSession(params: acp.LoadSessionRequest, cx: acp.AgentContext): Promise<acp.LoadSessionResponse> {
     const sessionId = params.sessionId;
@@ -529,9 +531,13 @@ export class AcpAgent {
     // read as "missing", or a server hiccup would abandon a live conversation.
     await ensureProjectOpen(this.host, this.port, projectDir);
     const tasks = await listTasksStrict(this.host, this.port, projectDir);
-    if (!tasks.some((task) => task.id === taskId)) {
+    const task = tasks.find((candidate) => candidate.id === taskId);
+    if (!task) {
       throw new Error(`Session not found: ${sessionId} (no AiderDesk task "${taskId}" in ${projectDir})`);
     }
+
+    applyTaskSettings(session, task);
+    await notifySessionTitle(cx, sessionId, task);
 
     const mode = replayMode();
     if (mode !== 'off') {
@@ -560,8 +566,10 @@ export class AcpAgent {
   }
 
   /**
-   * Resume a task (`session/resume`): bind the session to the task and ask the
-   * server to re-run the response to its last user message (best-effort).
+   * Resume a task (`session/resume`): bind the session to the task, adopt its
+   * own settings and title, and only then — when the server left the task
+   * mid-turn — ask it to continue (see `shouldResumeTask`). A client that
+   * reconnects to an idle task must not spend a model turn on it.
    */
   async resumeSession(params: acp.ResumeSessionRequest, cx: acp.AgentContext): Promise<acp.ResumeSessionResponse> {
     const sessionId = params.sessionId;
@@ -582,11 +590,18 @@ export class AcpAgent {
     const taskId = session.taskId ?? sessionId;
     await ensureProjectOpen(this.host, this.port, projectDir);
     const tasks = await listTasksStrict(this.host, this.port, projectDir);
-    if (!tasks.some((task) => task.id === taskId)) {
+    const task = tasks.find((candidate) => candidate.id === taskId);
+    if (!task) {
       throw new Error(`Session not found: ${sessionId} (no AiderDesk task "${taskId}" in ${projectDir})`);
     }
 
-    await resumeTask(this.host, this.port, projectDir, taskId);
+    applyTaskSettings(session, task);
+    await notifySessionTitle(cx, sessionId, task);
+
+    // Rebound above; only a task the server left mid-turn may be re-run.
+    if (shouldResumeTask(task)) {
+      await resumeTask(this.host, this.port, projectDir, taskId);
+    }
 
     return {
       modes: buildModeState(session.allModes, session.mode),
@@ -1238,55 +1253,12 @@ async function relaySse(
 
       case 'tool': {
         const toolId = eventData.id || '';
+        const toolName = eventData.toolName ?? '';
 
-        if (!eventData.finished) {
-          const args = parseToolArgs(eventData.args);
-          const filePath = extractFilePath(eventData.toolName ?? '', args);
-          const inputText = formatToolInputAsText(eventData.toolName ?? '', args);
-          const title = formatToolTitle(eventData.toolName ?? '', args);
-
-          await cx.notify(acp.methods.client.session.update, {
-            sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId: toolId,
-              title,
-              kind: inferToolKind(eventData.toolName ?? ''),
-              status: 'in_progress',
-              ...(eventData.args ? { rawInput: eventData.args } : {}),
-              ...(filePath ? { locations: [{ path: filePath }] } : {}),
-              ...(inputText
-                ? {
-                    content: [{ type: 'content' as const, content: { type: 'text' as const, text: inputText } }],
-                  }
-                : {}),
-            },
-          });
+        if (eventData.finished) {
+          await notifyToolCallEnd(cx, sessionId, toolId, toolName, eventData.args, eventData.response ?? '');
         } else {
-          const args = parseToolArgs(eventData.args);
-          const responseData = parseToolResponse(eventData.response ?? '');
-          const failed = isToolFailed(eventData.toolName ?? '', responseData);
-          const contentArray = buildToolCallContentArray(eventData.toolName ?? '', args, responseData);
-          const inputText = formatToolInputAsText(eventData.toolName ?? '', args);
-
-          const fullContent: acp.ToolCallContent[] = [];
-          if (inputText) {
-            fullContent.push({
-              type: 'content',
-              content: { type: 'text', text: inputText },
-            });
-          }
-          fullContent.push(...contentArray);
-
-          await cx.notify(acp.methods.client.session.update, {
-            sessionId,
-            update: {
-              sessionUpdate: 'tool_call_update',
-              toolCallId: toolId,
-              status: failed ? 'failed' : 'completed',
-              ...(fullContent.length > 0 ? { content: fullContent } : {}),
-            },
-          });
+          await notifyToolCallStart(cx, sessionId, toolId, toolName, eventData.args);
         }
         break;
       }
@@ -1357,6 +1329,142 @@ async function relaySse(
 }
 
 /**
+ * Notify a tool call's start: the update that carries the tool's name, kind and
+ * arguments. Clients render a tool's label from it, so live relays and session
+ * replays must both send it before the terminal `tool_call_update`.
+ */
+async function notifyToolCallStart(
+  cx: acp.AgentContext,
+  sessionId: string,
+  toolCallId: string,
+  toolName: string,
+  rawArgs: unknown,
+): Promise<void> {
+  const args = parseToolArgs(rawArgs);
+  const filePath = extractFilePath(toolName, args);
+  const inputText = formatToolInputAsText(toolName, args);
+
+  await cx.notify(acp.methods.client.session.update, {
+    sessionId,
+    update: {
+      sessionUpdate: 'tool_call',
+      toolCallId,
+      title: formatToolTitle(toolName, args),
+      kind: inferToolKind(toolName),
+      status: 'in_progress',
+      ...(rawArgs !== undefined ? { rawInput: rawArgs } : {}),
+      ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      ...(inputText
+        ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: inputText } }] }
+        : {}),
+    },
+  });
+}
+
+/** Notify a tool call's terminal state: its output content and completed/failed status. */
+async function notifyToolCallEnd(
+  cx: acp.AgentContext,
+  sessionId: string,
+  toolCallId: string,
+  toolName: string,
+  rawArgs: unknown,
+  response: string,
+): Promise<void> {
+  const args = parseToolArgs(rawArgs);
+  const responseData = parseToolResponse(response);
+  const inputText = formatToolInputAsText(toolName, args);
+
+  const fullContent: acp.ToolCallContent[] = [];
+  if (inputText) {
+    fullContent.push({ type: 'content', content: { type: 'text', text: inputText } });
+  }
+  fullContent.push(...buildToolCallContentArray(toolName, args, responseData));
+
+  await cx.notify(acp.methods.client.session.update, {
+    sessionId,
+    update: {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: isToolFailed(toolName, responseData) ? 'failed' : 'completed',
+      ...(fullContent.length > 0 ? { content: fullContent } : {}),
+    },
+  });
+}
+
+/**
+ * Task states in which the server still owns unfinished work. Resuming a task
+ * in one of them re-runs it, which is what a client reconnecting to an
+ * interrupted turn wants; any other state is idle and must only be rebound.
+ */
+const RESUMABLE_TASK_STATES = new Set(['IN_PROGRESS', 'INTERRUPTED']);
+
+/**
+ * Whether `session/resume` should ask the server to continue the task.
+ *
+ * ACP `session/resume` means "reconnect without replay", not "redo": calling
+ * `POST /api/project/resume-task` re-runs the conversation (`Task.resumeTask`),
+ * spending a model turn with no client attached. So it is limited to tasks the
+ * server left mid-turn. `AIDER_DESK_ACP_RESUME_TASK` overrides the guess:
+ * `1`/`true`/`on`/`yes` always resumes, `0`/`false`/`off`/`never` never does.
+ */
+function shouldResumeTask(task: TaskSummary | undefined): boolean {
+  const raw = (process.env.AIDER_DESK_ACP_RESUME_TASK ?? '').trim().toLowerCase();
+  if (raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes') {
+    return true;
+  }
+  if (raw === '0' || raw === 'false' || raw === 'off' || raw === 'never') {
+    return false;
+  }
+  return task?.state !== undefined && RESUMABLE_TASK_STATES.has(task.state);
+}
+
+/**
+ * Mirror a task's own session settings onto the ACP session that loads or
+ * resumes it, so a reloaded shell shows the profile/model/mode the task
+ * actually runs with instead of the project defaults. Values the server no
+ * longer offers are ignored rather than advertised as unselectable.
+ */
+function applyTaskSettings(session: AcpSession, task: TaskSummary | undefined): void {
+  if (!task) {
+    return;
+  }
+  if (task.currentMode && session.allModes.some((mode) => mode.id === task.currentMode)) {
+    session.mode = task.currentMode;
+  }
+  if (task.agentProfileId && session.agentProfiles.some((profile) => profile.id === task.agentProfileId)) {
+    session.agentProfileId = task.agentProfileId;
+  }
+  if (task.autonomyMode && AUTONOMY_MODES.some((mode) => mode.id === task.autonomyMode)) {
+    session.autonomyMode = task.autonomyMode;
+  }
+  if (task.provider && task.model) {
+    const composed = `${task.provider}/${task.model}`;
+    if (session.models.some((model) => `${model.providerId}/${model.id}` === composed)) {
+      session.model = composed;
+    }
+  }
+}
+
+/** Announce a task's title so a client shows the session name it restored. */
+async function notifySessionTitle(
+  cx: acp.AgentContext,
+  sessionId: string,
+  task: TaskSummary | undefined,
+): Promise<void> {
+  if (!task?.name) {
+    return;
+  }
+  await cx.notify(acp.methods.client.session.update, {
+    sessionId,
+    update: {
+      sessionUpdate: 'session_info_update',
+      title: task.name,
+      updatedAt: task.updatedAt ?? new Date().toISOString(),
+    },
+  });
+}
+
+/**
  * Replay a task's stored conversation (`POST /api/project/tasks/load` messages)
  * to the ACP client as session updates so it can render the restored session.
  * User messages, assistant reasoning/content and tool calls map to the same
@@ -1410,48 +1518,17 @@ async function replayTaskMessages(
         if (!message.id || !message.toolName) {
           break;
         }
-        const args = parseToolArgs(message.args);
-        const filePath = extractFilePath(message.toolName, args);
-        const inputText = formatToolInputAsText(message.toolName, args);
-        const title = formatToolTitle(message.toolName, args);
-
-        if (message.finished !== true) {
-          await cx.notify(acp.methods.client.session.update, {
+        await notifyToolCallStart(cx, sessionId, message.id, message.toolName, message.args);
+        if (message.finished === true) {
+          await notifyToolCallEnd(
+            cx,
             sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId: message.id,
-              title,
-              kind: inferToolKind(message.toolName),
-              status: 'in_progress',
-              ...(message.args !== undefined ? { rawInput: message.args } : {}),
-              ...(filePath ? { locations: [{ path: filePath }] } : {}),
-              ...(inputText
-                ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: inputText } }] }
-                : {}),
-            },
-          });
-          break;
+            message.id,
+            message.toolName,
+            message.args,
+            message.response ?? '',
+          );
         }
-
-        const responseData = parseToolResponse(message.response ?? '');
-        const failed = isToolFailed(message.toolName, responseData);
-        const contentArray = buildToolCallContentArray(message.toolName, args, responseData);
-        const fullContent: acp.ToolCallContent[] = [];
-        if (inputText) {
-          fullContent.push({ type: 'content', content: { type: 'text', text: inputText } });
-        }
-        fullContent.push(...contentArray);
-
-        await cx.notify(acp.methods.client.session.update, {
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call_update',
-            toolCallId: message.id,
-            status: failed ? 'failed' : 'completed',
-            ...(fullContent.length > 0 ? { content: fullContent } : {}),
-          },
-        });
         break;
       }
     }

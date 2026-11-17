@@ -197,6 +197,12 @@ export type TaskSummary = {
   state?: string;
   archived?: boolean;
   updatedAt?: string;
+  /** Task's own session settings, so a loaded session can mirror them. */
+  agentProfileId?: string;
+  autonomyMode?: string;
+  provider?: string;
+  model?: string;
+  currentMode?: string;
 };
 
 /**
@@ -231,6 +237,11 @@ async function requestTaskList(
           ...(t.state ? { state: t.state } : {}),
           ...(typeof t.archived === 'boolean' ? { archived: t.archived } : {}),
           ...(t.updatedAt ? { updatedAt: t.updatedAt } : {}),
+          ...(t.agentProfileId ? { agentProfileId: t.agentProfileId } : {}),
+          ...(t.autonomyMode ? { autonomyMode: t.autonomyMode } : {}),
+          ...(t.provider ? { provider: t.provider } : {}),
+          ...(t.model ? { model: t.model } : {}),
+          ...(t.currentMode ? { currentMode: t.currentMode } : {}),
         }))
       : undefined;
   } catch {

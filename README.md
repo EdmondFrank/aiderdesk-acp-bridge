@@ -17,7 +17,9 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   eagerly as a server task at `session/new` (its task id is the ACP session id),
   so sessions survive bridge restarts: any ACP client can list tasks and restore
   a conversation (`session/load` replays the stored conversation, which agent-shell
-  renders per its restore verbosity)
+  renders per its restore verbosity, and `session/load`/`session/resume` adopt the
+  task's own title, mode, profile and model); `session/resume` only asks the
+  server to continue a task it left `IN_PROGRESS`/`INTERRUPTED`
 - Mode / agent-profile / autonomy / model configuration surfaced as ACP session config options (model changes persist to the task via the REST API)
 - Slash commands: custom commands (`~/.aider-desk/commands/` and
   `<project>/.aider-desk/commands/`) are advertised to ACP clients and executed
@@ -79,6 +81,7 @@ bun run build
 | `AIDER_DESK_ACP_AUTO_ANSWER`   | Answer AiderDesk questions on the client's behalf (`POST /api/project/answer-question`); enable for clients without an approval UI | `off` |
 | `AIDER_DESK_ACP_AUTO_ANSWER_MODE` | `once` submits one answer per question; `always` may pick the question's `a` (all / always) option, which the server then remembers for the rest of the task | `once` |
 | `AIDER_DESK_ACP_REPLAY`        | How much of a loaded task `session/load` replays: `full`, `tail` (last 20 messages) or `off` | `full` |
+| `AIDER_DESK_ACP_RESUME_TASK`   | Whether `session/resume` asks the server to continue the task (`POST /api/project/resume-task`, which runs a model turn). Unset: only tasks the server left `IN_PROGRESS`/`INTERRUPTED`; `1`/`true` always; `0`/`false` never | unset |
 | `AIDER_DESK_ACP_STATE_DIR`     | Directory holding the session-id → task-id map (survives bridge restarts) | `~/.local/state/aiderdesk-acp` |
 
 Timeouts are read once at startup and are expressed in milliseconds.
@@ -129,8 +132,8 @@ meaningless `y`; the turn ends either way.
 | `session/new`                   | `POST /api/project/add-open`, `POST /api/project/tasks/new`, `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` — creates the backing task eagerly so the session id is a stable task id |
 | `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks`             |
 | `session/list_input_history`    | `GET /api/project/input-history` (custom extension method; used by agent-shell's input-history command) |
-| `session/load`                  | `POST /api/project/tasks/load` (replays the stored conversation as session updates, per `AIDER_DESK_ACP_REPLAY`; fails when the task no longer exists so the client can start fresh) |
-| `session/resume`                | `POST /api/project/resume-task` (fails when the task no longer exists, like `session/load`) |
+| `session/load`                  | `POST /api/project/add-open`, `GET /api/project/tasks` (validates the task and adopts its title + settings), `POST /api/project/tasks/load` (replays the stored conversation as session updates, per `AIDER_DESK_ACP_REPLAY`; fails when the task no longer exists so the client can start fresh) |
+| `session/resume`                | `POST /api/project/add-open`, `GET /api/project/tasks` (validates the task and adopts its title + settings), `POST /api/project/resume-task` only when the task is `IN_PROGRESS`/`INTERRUPTED` or `AIDER_DESK_ACP_RESUME_TASK` forces it; fails when the task no longer exists, like `session/load` |
 | `session/delete`                | `POST /api/project/tasks/delete`                                   |
 | `session/prompt`                | `POST /api/run-prompt` (SSE)                                       |
 | `session/cancel`                | aborts the SSE request + `POST /api/project/interrupt`             |
