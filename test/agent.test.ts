@@ -192,6 +192,102 @@ describe('AcpAgent', () => {
     ]);
   });
 
+  test('session/load advertises available commands after the replayed history', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [{ name: 'release', description: 'Cut a release', arguments: [] }],
+          extensionCommands: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Restored' }]), { status: 200 }),
+    );
+    router.add('POST', '/api/project/tasks/load', () =>
+      new Response(JSON.stringify({ messages: [{ type: 'user', id: 'u1', content: 'hello' }] }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    await agent.loadSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+    // Deferred on purpose: the response must be on the wire before the advert.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const updates = notifyCalls
+      .filter((c) => c.method === acp.methods.client.session.update)
+      .map(
+        (c) =>
+          c.params as {
+            update: { sessionUpdate: string; availableCommands?: Array<{ name: string }> };
+          },
+      );
+    const kinds = updates.map((p) => p.update.sessionUpdate);
+
+    expect(kinds.indexOf('user_message_chunk')).toBeLessThan(kinds.indexOf('available_commands_update'));
+    expect(updates.at(-1)!.update.sessionUpdate).toBe('available_commands_update');
+    expect(updates.at(-1)!.update.availableCommands!.map((c) => c.name)).toEqual([
+      'compact',
+      'handoff',
+      'load',
+      'new',
+      'release',
+      'smart-compact',
+      'tasks',
+    ]);
+  });
+
+  test('session/resume advertises available commands', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/settings', () => new Response('{}', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(
+        JSON.stringify({
+          customCommands: [{ name: 'release', description: 'Cut a release', arguments: [] }],
+          extensionCommands: [],
+        }),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/tasks', () =>
+      new Response(JSON.stringify([{ id: 'task-9', baseDir: '/proj', name: 'Resumed' }]), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    await agent.resumeSession({ sessionId: 'task-9', cwd: '/proj', mcpServers: [] }, cx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const advert = notifyCalls
+      .filter((c) => c.method === acp.methods.client.session.update)
+      .map(
+        (c) =>
+          c.params as {
+            update: { sessionUpdate: string; availableCommands?: Array<{ name: string }> };
+          },
+      )
+      .find((p) => p.update.sessionUpdate === 'available_commands_update');
+
+    expect(advert?.update.availableCommands?.map((c) => c.name)).toEqual([
+      'compact',
+      'handoff',
+      'load',
+      'new',
+      'release',
+      'smart-compact',
+      'tasks',
+    ]);
+  });
+
   test('prompt translates SSE events into ACP session updates', async () => {
     const router = createMockRouter();
     router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));

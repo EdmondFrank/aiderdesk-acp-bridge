@@ -322,22 +322,7 @@ export class AcpAgent {
       session.model,
     );
 
-    // Advertise slash commands once the session is created. The notification
-    // is deferred so the session/new response is written to the client first
-    // (a notification referencing an unknown session id would be dropped).
-    const availableCommands = toAvailableCommands(session.commands);
-    if (availableCommands.length > 0) {
-      setTimeout(() => {
-        void cx
-          .notify(acp.methods.client.session.update, {
-            sessionId,
-            update: { sessionUpdate: 'available_commands_update', availableCommands },
-          })
-          .catch(() => {
-            // best-effort: the client may not support commands
-          });
-      }, 0);
-    }
+    this.advertiseCommands(session, sessionId, cx);
 
     // Publish the context window once the client knows the session, so its
     // header can show `used/size` before the first turn. Deferred for the same
@@ -466,6 +451,35 @@ export class AcpAgent {
       commands,
       usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     };
+  }
+
+  /**
+   * Advertise the session's slash commands to the client.
+   *
+   * Every path that can introduce a session calls this — `session/new`,
+   * `session/load` and `session/resume` — because clients restore persisted
+   * sessions without ever re-issuing `session/new`, and would otherwise hold
+   * no commands to complete `/` from.
+   *
+   * The notification is deferred so the response is written to the client
+   * first: a notification referencing a session id the client has not seen yet
+   * would be dropped.
+   */
+  private advertiseCommands(session: AcpSession, sessionId: string, cx: acp.AgentContext): void {
+    const availableCommands = toAvailableCommands(session.commands);
+    if (availableCommands.length === 0) {
+      return;
+    }
+    setTimeout(() => {
+      void cx
+        .notify(acp.methods.client.session.update, {
+          sessionId,
+          update: { sessionUpdate: 'available_commands_update', availableCommands },
+        })
+        .catch(() => {
+          // best-effort: the client may not support commands
+        });
+    }, 0);
   }
 
   async setConfigOption(params: acp.SetSessionConfigOptionRequest): Promise<acp.SetSessionConfigOptionResponse> {
@@ -640,6 +654,10 @@ export class AcpAgent {
       // best-effort: a failed usage update must not fail the load
     });
 
+    // A restored session is the only session most clients ever see, so its
+    // commands have to be re-advertised here (see `advertiseCommands`).
+    this.advertiseCommands(session, sessionId, cx);
+
     return {
       modes: buildModeState(session.allModes, session.mode),
       configOptions: buildConfigOptions(
@@ -698,6 +716,10 @@ export class AcpAgent {
     await this.publishContextUsage(session, sessionId, cx, { requireKnownUsed: true }).catch(() => {
       // best-effort: a failed usage update must not fail the resume
     });
+
+    // Resumed sessions are the common case for a client that restores its
+    // layout, so advertise commands or `/` completion has nothing to offer.
+    this.advertiseCommands(session, sessionId, cx);
 
     return {
       modes: buildModeState(session.allModes, session.mode),
