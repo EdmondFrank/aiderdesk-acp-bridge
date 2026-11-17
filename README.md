@@ -130,7 +130,7 @@ meaningless `y`; the turn ends either way.
 | ACP method                      | AiderDesk REST call(s)                                             |
 | ------------------------------- | ------------------------------------------------------------------ |
 | `session/new`                   | `POST /api/project/add-open`, `POST /api/project/tasks/new`, `GET /api/agent-profiles`, `GET /api/project/custom-modes`, `GET /api/project/settings`, `GET /api/project/commands` — creates the backing task eagerly so the session id is a stable task id |
-| `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks`             |
+| `session/list`                  | `POST /api/project/add-open`, `GET /api/project/tasks` — sessions are returned newest-created first (archived tasks are hidden; undated tasks go last) |
 | `session/list_input_history`    | `GET /api/project/input-history` (custom extension method; used by agent-shell's input-history command) |
 | `session/load`                  | `POST /api/project/add-open`, `GET /api/project/tasks` (validates the task and adopts its title + settings), `POST /api/project/tasks/load` (replays the stored conversation as session updates, per `AIDER_DESK_ACP_REPLAY`; fails when the task no longer exists so the client can start fresh) |
 | `session/resume`                | `POST /api/project/add-open`, `GET /api/project/tasks` (validates the task and adopts its title + settings), `POST /api/project/resume-task` only when the task is `IN_PROGRESS`/`INTERRUPTED` or `AIDER_DESK_ACP_RESUME_TASK` forces it; fails when the task no longer exists, like `session/load` |
@@ -153,7 +153,7 @@ Commands are invoked by sending `/name arg1 arg2` as the prompt:
   | Command          | AiderDesk REST call                     | Notes                                              |
   | ---------------- | --------------------------------------- | -------------------------------------------------- |
   | `/new [name]`    | `POST /api/project/tasks/new`           | starts a new task and makes it the session's task  |
-  | `/tasks`         | `POST /api/project/add-open`, `GET /api/project/tasks` | lists the project's tasks as a numbered thought chunk |
+  | `/tasks`         | `POST /api/project/add-open`, `GET /api/project/tasks` | lists the project's tasks as a numbered thought chunk, newest-created first |
   | `/load <id\|#n>` | sets the session's task (via `GET /api/project/tasks`) | `#n` refers to the number shown by `/tasks`; a task id or unique id prefix also works |
   | `/compact [hint]`| `POST /api/project/compact-conversation`| requires an existing task                           |
   | `/smart-compact` | `POST /api/project/smart-compact-conversation` | requires an existing task                  |

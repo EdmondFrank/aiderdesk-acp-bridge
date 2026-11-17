@@ -196,6 +196,7 @@ export type TaskSummary = {
   name: string;
   state?: string;
   archived?: boolean;
+  createdAt?: string;
   updatedAt?: string;
   /** Task's own session settings, so a loaded session can mirror them. */
   agentProfileId?: string;
@@ -236,6 +237,7 @@ async function requestTaskList(
           name: t.name,
           ...(t.state ? { state: t.state } : {}),
           ...(typeof t.archived === 'boolean' ? { archived: t.archived } : {}),
+          ...(t.createdAt ? { createdAt: t.createdAt } : {}),
           ...(t.updatedAt ? { updatedAt: t.updatedAt } : {}),
           ...(t.agentProfileId ? { agentProfileId: t.agentProfileId } : {}),
           ...(t.autonomyMode ? { autonomyMode: t.autonomyMode } : {}),

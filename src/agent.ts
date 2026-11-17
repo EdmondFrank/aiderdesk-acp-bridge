@@ -482,21 +482,21 @@ export class AcpAgent {
    * List the AiderDesk tasks for a working directory as ACP sessions
    * (`session/list`). Task ids are stable across bridge restarts, so any task
    * can later be loaded with `session/load` from a fresh client session.
-   * Archived tasks are hidden; failures degrade to an empty list.
+   * Sessions are listed newest-created first (the server answers in insertion
+   * order); archived tasks are hidden and failures degrade to an empty list.
    */
   async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
     const cwd = params.cwd ?? '';
     await ensureProjectOpen(this.host, this.port, cwd);
     const tasks = await listTasks(this.host, this.port, cwd);
+    const visible = sortTasksNewestFirst(tasks.filter((task) => task.archived !== true));
     return {
-      sessions: tasks
-        .filter((task) => task.archived !== true)
-        .map((task) => ({
-          sessionId: task.id,
-          cwd: task.baseDir || cwd,
-          ...(task.name ? { title: task.name } : {}),
-          ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
-        })),
+      sessions: visible.map((task) => ({
+        sessionId: task.id,
+        cwd: task.baseDir || cwd,
+        ...(task.name ? { title: task.name } : {}),
+        ...(task.updatedAt ? { updatedAt: task.updatedAt } : {}),
+      })),
     };
   }
 
@@ -858,7 +858,7 @@ export class AcpAgent {
         }
         case 'tasks': {
           await ensureProjectOpen(this.host, this.port, session.cwd);
-          const tasks = await listTasks(this.host, this.port, session.cwd);
+          const tasks = sortTasksNewestFirst(await listTasks(this.host, this.port, session.cwd));
           if (tasks.length === 0) {
             await notifyThought(cx, sessionId, 'No tasks for this project yet.');
             return { stopReason: 'end_turn' };
@@ -873,7 +873,7 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           await ensureProjectOpen(this.host, this.port, session.cwd);
-          const tasks = await listTasks(this.host, this.port, session.cwd);
+          const tasks = sortTasksNewestFirst(await listTasks(this.host, this.port, session.cwd));
           const task = resolveTask(tasks, target);
           if (!task) {
             await notifyThought(
@@ -1616,6 +1616,33 @@ function formatTaskDate(iso: string): string {
     return iso.slice(0, 16);
   }
   return date.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+}
+
+/**
+ * Order tasks newest-created first, falling back to `updatedAt` for tasks the
+ * server did not date (task files written before `createdAt` existed). Undated
+ * tasks go last so they cannot displace real dates, and equal dates keep the
+ * server's order. `/tasks`, `/load #N` and `session/list` share this order, so
+ * the number a client sees is the one it can load.
+ */
+function sortTasksNewestFirst(tasks: TaskSummary[]): TaskSummary[] {
+  const timeOf = (task: TaskSummary): number | undefined => {
+    const raw = task.createdAt ?? task.updatedAt;
+    const time = raw ? Date.parse(raw) : NaN;
+    return Number.isNaN(time) ? undefined : time;
+  };
+
+  return [...tasks].sort((a, b) => {
+    const aTime = timeOf(a);
+    const bTime = timeOf(b);
+    if (aTime === undefined || bTime === undefined) {
+      if (aTime === bTime) {
+        return 0;
+      }
+      return aTime === undefined ? 1 : -1;
+    }
+    return bTime - aTime;
+  });
 }
 
 /** Numbered, human-readable listing of a project's tasks (for the /tasks command). */
