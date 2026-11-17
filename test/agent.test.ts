@@ -748,17 +748,23 @@ describe('AcpAgent', () => {
       seenBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
       return new Response(JSON.stringify({ message: 'Conversation compacted' }), { status: 200 });
     });
-    router.add('GET', '/api/readonly/tasks/task-1', () =>
-      new Response(
-        JSON.stringify({
-          messages: [
-            { type: 'user', messageId: 'm1', content: 'hello' },
-            { type: 'response-completed', messageId: 'm2', content: 'The condensed summary.' },
-          ],
-        }),
-        { status: 200 },
-      ),
-    );
+    let contextReads = 0;
+    router.add('GET', '/api/readonly/tasks/task-1', () => {
+      contextReads += 1;
+      // The compaction replaces a long conversation with one summary message,
+      // so the context read before it is much larger than the one after.
+      const messages =
+        contextReads === 1
+          ? [
+              { type: 'user', messageId: 'm0', content: 'hello' },
+              { type: 'response-completed', messageId: 'm1', content: 'x'.repeat(40_000) },
+            ]
+          : [
+              { type: 'user', messageId: 'm0', content: 'hello' },
+              { type: 'response-completed', messageId: 'm2', content: 'The condensed summary.' },
+            ];
+      return new Response(JSON.stringify({ messages }), { status: 200 });
+    });
     globalThis.fetch = router.router as typeof fetch;
 
     const agent = new AcpAgent('localhost', 24337);
@@ -2133,5 +2139,118 @@ describe('AcpAgent', () => {
       .find((update) => update?.sessionUpdate === 'usage_update');
 
     expect(usageUpdate).toEqual({ sessionUpdate: 'usage_update', used: 3050, size: 200000 });
+  });
+
+  test('/compact republishes a lowered context figure', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([{ id: 'default', name: 'Default', provider: 'openai-compatible', model: 'ctx-model' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () => new Response(JSON.stringify({ agentProfileId: 'default' }), { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({ models: [{ id: 'ctx-model', providerId: 'openai-compatible', maxInputTokens: 200000 }] }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/project/compact-conversation', () =>
+      new Response(JSON.stringify({ message: 'Conversation compacted' }), { status: 200 }),
+    );
+    // 20,000 characters before the compaction become 2,000 after it.
+    let contextReads = 0;
+    router.add('GET', '/api/readonly/tasks/task-1', () => {
+      contextReads += 1;
+      return new Response(
+        JSON.stringify({
+          messages: [{ type: 'response-completed', messageId: 'm1', content: 'x'.repeat(contextReads === 1 ? 20_000 : 2_000) }],
+        }),
+        { status: 200 },
+      );
+    });
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'response-completed',
+            data: { messageId: 'm1', usageReport: { sentTokens: 1000, receivedTokens: 100, cacheReadTokens: 9000 } },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/compact' }] }, cx);
+
+    const useds = notifyCalls
+      .map((call) => (call.params as { update?: { sessionUpdate?: string; used?: number } })?.update)
+      .filter((update) => update?.sessionUpdate === 'usage_update')
+      .map((update) => update?.used);
+
+    // The turn cost 10,100 tokens over 20,000 characters; the compacted
+    // transcript is 2,000 characters, so the header drops to ~1,010 instead of
+    // keeping the pre-compaction figure until the next prompt.
+    expect(useds.slice(-2)).toEqual([10_100, 1_010]);
+  });
+
+  test('/new resets the published context figure', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () =>
+      new Response(
+        JSON.stringify([{ id: 'default', name: 'Default', provider: 'openai-compatible', model: 'ctx-model' }]),
+        { status: 200 },
+      ),
+    );
+    router.add('GET', '/api/project/settings', () => new Response(JSON.stringify({ agentProfileId: 'default' }), { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    router.add('GET', '/api/models', () =>
+      new Response(
+        JSON.stringify({ models: [{ id: 'ctx-model', providerId: 'openai-compatible', maxInputTokens: 200000 }] }),
+        { status: 200 },
+      ),
+    );
+    router.add('POST', '/api/run-prompt', () =>
+      new Response(
+        sseBody([
+          {
+            type: 'response-completed',
+            data: { messageId: 'm1', usageReport: { sentTokens: 1000, receivedTokens: 100, cacheReadTokens: 9000 } },
+          },
+          { type: 'stream-end', data: {} },
+        ]),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: 'hi' }] }, cx);
+    await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/new' }] }, cx);
+
+    const useds = notifyCalls
+      .map((call) => (call.params as { update?: { sessionUpdate?: string; used?: number } })?.update)
+      .filter((update) => update?.sessionUpdate === 'usage_update')
+      .map((update) => update?.used);
+
+    // A task with no turn yet occupies nothing, so the header clears instead of
+    // keeping the previous task's figure.
+    expect(useds.slice(-2)).toEqual([10_100, 0]);
   });
 });

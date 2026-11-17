@@ -71,6 +71,10 @@ export type TaskReadMessage = {
   type?: string;
   messageId?: string;
   content?: string;
+  reasoning?: string;
+  /** A tool message's result: the bulk of what a context weighs. */
+  response?: string;
+  args?: unknown;
 };
 
 /**

@@ -34,7 +34,9 @@ the AiderDesk REST API (`/api/run-prompt`, `/api/agent-profiles`, `/api/project/
   window (`size`, resolved from the selected model, the agent profile's model or the
   project's `mainModel`) next to the last turn's prompt tokens (`used`), and is
   published when a session is created or reloaded and whenever the model changes —
-  so an ACP client's header shows `used/size` just as it does for Pi
+  so an ACP client's header shows `used/size` just as it does for Pi. A compaction
+  done by the bridge (`/compact`, `/smart-compact`, idle compaction) republishes the
+  shrunk figure immediately, estimated from the compacted transcript.
 - Standing prompts for clients that own the system prompt: `_meta.systemPromptOverride`
   becomes `<project>/.aider-desk/rules/raft-standing-prompt.md`, so AiderDesk renders it
   into the system prompt instead of the conversation history. Session-id → task-id

@@ -49,7 +49,7 @@ versions exist and must not be confused:
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 231 tests across 13 files
+bun test            # bun:test suite — 239 tests across 13 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -68,7 +68,7 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 | `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `listTasksStrict`, `loadTaskStrict`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `updateTaskFields`, `answerQuestion`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers; the `…Strict` variants distinguish "request failed" from "empty/missing", which is what `session/load` needs. |
 | `src/session-policy.ts` | Per-project session state that must outlive the process: `writeStandingPrompt`/`clearStandingPrompt` (the ACP standing prompt as `<project>/.aider-desk/rules/raft-standing-prompt.md`, which AiderDesk renders into the system prompt) and the session-id → task-id map (`rememberSessionTask`, `resolveSessionTask`, `forgetSessionTask`) persisted under `$AIDER_DESK_ACP_STATE_DIR` (default `~/.local/state/aiderdesk-acp`). |
 | `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project settings/provider models (`fetchAgentProfiles` keeps each profile's `provider`/`model`, `fetchProviderModels` keeps `maxInputTokens`, `fetchProjectSettings` returns the default profile + `mainModel`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
-| `src/context-usage.ts` | Context-window resolution for `usage_update`: `resolveContextModel` (session selection → agent profile's model → project `mainModel`, ignoring models the server no longer lists), `contextWindowFor`, `parseComposedModelId`, `lastContextTokensFrom` (seeds `used` when a loaded conversation is replayed). |
+| `src/context-usage.ts` | Context-window resolution for `usage_update`: `resolveContextModel` (session selection → agent profile's model → project `mainModel`, ignoring models the server no longer lists), `contextWindowFor`, `parseComposedModelId`, `lastContextTokensFrom` (seeds `used` when a loaded conversation is replayed), `estimateContextTokens` (the figure a compaction leaves behind, which no turn measures). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
 | `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle`, `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
 | `src/constants.ts` | Host/port defaults, env port resolution, built-in modes, `AIDER_MODES`, autonomy modes, default mode/autonomy. |
@@ -147,6 +147,17 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   unknown (`maxInputTokens` absent, or a model the server no longer lists) — a
   `size: 0` update would only hide a client's indicator. `setConfigOption` has no
   `AgentContext` parameter, so the agent keeps the last one in `clientContext`.
+- **A compaction moves `used` without a turn.** No usage report is produced while
+  AiderDesk replaces the transcript, so `/compact`, `/smart-compact` and idle
+  compaction estimate the figure from what survived: `estimateContextTokens`
+  scales the compacted characters by the tokens-per-character ratio the last turn
+  was billed at, and falls back to `0` when there is no ratio yet.
+  `contextCharsOf` counts tool `response`/`args` too — they are most of what a
+  long context weighs, so a `content`-only size would be off by an order of
+  magnitude. `/new` and `/handoff` publish `0` outright. A compaction performed
+  in the AiderDesk UI is still invisible to the bridge — the run-prompt SSE
+  stream carries no tokens/context event and the bridge is idle while it
+  happens — so the header keeps the last turn's figure until the next prompt.
 - **Built-in commands cannot be shadowed** — they resolve before project
   custom/extension commands.
 - **Custom command limitations**: `includeContext: false` and `skills` frontmatter

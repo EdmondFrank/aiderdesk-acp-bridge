@@ -59,7 +59,7 @@ import {
   type AgentProfileInfo,
   type ModelInfo,
 } from './modes';
-import { contextWindowFor, lastContextTokensFrom } from './context-usage';
+import { contextWindowFor, estimateContextTokens, lastContextTokensFrom } from './context-usage';
 import {
   buildStandingPromptStub,
   clearStandingPrompt,
@@ -370,25 +370,30 @@ export class AcpAgent {
    * would only hide the indicator a client could otherwise show. With
    * `requireKnownUsed`, a session whose context size was never observed (a
    * reconnect to an old task) is skipped rather than reported as empty.
+   *
+   * `used` overrides the session's last measured turn, for the figures that do
+   * not come from one: a compaction estimates the text it left behind, and a
+   * new task resets to zero.
    */
   private async publishContextUsage(
     session: AcpSession,
     sessionId: string,
     cx: acp.AgentContext,
-    options?: { requireKnownUsed?: boolean },
+    options?: { requireKnownUsed?: boolean; used?: number },
   ): Promise<void> {
     const size = contextWindowFor(session);
     if (size <= 0) {
       return;
     }
-    if (options?.requireKnownUsed && session.lastContextTokens === undefined) {
+    const used = options?.used ?? session.lastContextTokens;
+    if (options?.requireKnownUsed && used === undefined) {
       return;
     }
     await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: 'usage_update',
-        used: session.lastContextTokens ?? 0,
+        used: used ?? 0,
         size,
       },
     });
@@ -946,6 +951,9 @@ export class AcpAgent {
           session.lastContextTokens = 0;
           session.idleCompactUseless = false;
           await rememberSessionTask(sessionId, taskId, session.cwd);
+          await this.publishContextUsage(session, sessionId, cx, { used: 0 }).catch(() => {
+            // best-effort: the client may not render usage updates
+          });
           await notifyThought(cx, sessionId, `Started a new task${name ? `: ${name}` : ''}.`);
           return { stopReason: 'end_turn' };
         }
@@ -993,6 +1001,8 @@ export class AcpAgent {
             return { stopReason: 'end_turn' };
           }
           const customInstructions = args.join(' ').trim() || undefined;
+          const tokensBefore = session.lastContextTokens;
+          const beforeChars = contextCharsOf(await fetchTask(this.host, this.port, session.cwd, session.taskId));
           await compactConversation(
             this.host,
             this.port,
@@ -1001,8 +1011,16 @@ export class AcpAgent {
             session.mode,
             customInstructions,
           );
-          if (await this.notifyCompactionResult(cx, sessionId, session.cwd, session.taskId, 'Conversation compacted.')) {
-            session.lastContextTokens = 0;
+          const compacted = await this.notifyCompactionResult(
+            cx,
+            sessionId,
+            session.cwd,
+            session.taskId,
+            'Conversation compacted.',
+            { beforeChars },
+          );
+          if (compacted.shrank) {
+            await this.publishCompactedContext(session, sessionId, cx, beforeChars, compacted.afterChars, tokensBefore);
           }
           return { stopReason: 'end_turn' };
         }
@@ -1011,19 +1029,19 @@ export class AcpAgent {
             await notifyThought(cx, sessionId, 'No conversation to compact yet. Send a message first.');
             return { stopReason: 'end_turn' };
           }
+          const tokensBefore = session.lastContextTokens;
           const beforeChars = contextCharsOf(await fetchTask(this.host, this.port, session.cwd, session.taskId));
           await smartCompactConversation(this.host, this.port, session.cwd, session.taskId);
-          if (
-            await this.notifyCompactionResult(
-              cx,
-              sessionId,
-              session.cwd,
-              session.taskId,
-              'Conversation smart-compacted.',
-              { beforeChars },
-            )
-          ) {
-            session.lastContextTokens = 0;
+          const compacted = await this.notifyCompactionResult(
+            cx,
+            sessionId,
+            session.cwd,
+            session.taskId,
+            'Conversation smart-compacted.',
+            { beforeChars },
+          );
+          if (compacted.shrank) {
+            await this.publishCompactedContext(session, sessionId, cx, beforeChars, compacted.afterChars, tokensBefore);
           }
           return { stopReason: 'end_turn' };
         }
@@ -1039,6 +1057,9 @@ export class AcpAgent {
             session.lastContextTokens = 0;
             session.idleCompactUseless = false;
             await rememberSessionTask(sessionId, newTaskId, session.cwd);
+            await this.publishContextUsage(session, sessionId, cx, { used: 0 }).catch(() => {
+              // best-effort: the client may not render usage updates
+            });
             await notifyThought(cx, sessionId, 'Conversation handed off.');
           } else {
             await notifyThought(
@@ -1063,8 +1084,9 @@ export class AcpAgent {
   /**
    * After a compaction, relay the server's new compacted context summary to the
    * client so the session reflects what replaced the conversation. Returns
-   * whether the context actually shrank: a compaction that changed nothing has
-   * no summary to relay and must not be announced as one.
+   * whether the context actually shrank — a compaction that changed nothing has
+   * no summary to relay and must not be announced as one — together with the
+   * size it shrank to, which the usage figure is derived from.
    */
   private async notifyCompactionResult(
     cx: acp.AgentContext,
@@ -1073,24 +1095,50 @@ export class AcpAgent {
     taskId: string,
     fallbackText: string,
     options: { beforeChars?: number; background?: boolean } = {},
-  ): Promise<boolean> {
+  ): Promise<{ shrank: boolean; afterChars?: number }> {
     const messages = await fetchTask(this.host, this.port, projectDir, taskId);
-    const outcome = evaluateCompaction(options.beforeChars, contextCharsOf(messages));
+    const afterChars = contextCharsOf(messages);
+    const outcome = evaluateCompaction(options.beforeChars, afterChars);
     if (!outcome.shrank) {
       process.stderr.write(`[compaction] ${fallbackText} changed nothing (${outcome.detail})\n`);
       if (!options.background) {
         await notifyThought(cx, sessionId, `Nothing to compact: the context is unchanged (${outcome.detail}).`);
       }
-      return false;
+      return { shrank: false };
     }
 
     const summary = extractCompactionSummary(messages);
     if (summary) {
       await notifyThought(cx, sessionId, `${fallbackText} The conversation was replaced by this summary:\n\n${summary}`);
-      return true;
+      return { shrank: true, afterChars };
     }
     await notifyThought(cx, sessionId, fallbackText);
-    return true;
+    return { shrank: true, afterChars };
+  }
+
+  /**
+   * Publish the context figure a compaction left behind.
+   *
+   * No turn runs while the transcript is replaced, so there is no usage report
+   * to read: the compacted size is estimated from the text that survived, at
+   * the tokens-per-character ratio the last turn was actually billed at. With
+   * no ratio to apply (no turn yet) it resets to zero — nothing has been sent
+   * since the context was replaced — rather than leaving the pre-compaction
+   * figure on the client's header until the next prompt.
+   */
+  private async publishCompactedContext(
+    session: AcpSession,
+    sessionId: string,
+    cx: acp.AgentContext,
+    beforeChars: number | undefined,
+    afterChars: number | undefined,
+    tokensBefore: number | undefined,
+  ): Promise<void> {
+    const used = estimateContextTokens(afterChars, tokensBefore, beforeChars) ?? 0;
+    session.lastContextTokens = used;
+    await this.publishContextUsage(session, sessionId, cx, { used }).catch(() => {
+      // best-effort: the client may not render usage updates
+    });
   }
 
   async cancel(params: acp.CancelNotification): Promise<void> {
@@ -1196,6 +1244,7 @@ export class AcpAgent {
 
     session.idleCompaction = (async () => {
       try {
+        const tokensBefore = session.lastContextTokens;
         const beforeChars = contextCharsOf(await fetchTask(this.host, this.port, session.cwd, taskId));
         await smartCompactConversation(this.host, this.port, session.cwd, taskId);
         if (beforeChars === undefined) {
@@ -1203,7 +1252,7 @@ export class AcpAgent {
           return;
         }
 
-        const shrank = await this.notifyCompactionResult(
+        const compacted = await this.notifyCompactionResult(
           cx,
           sessionId,
           session.cwd,
@@ -1211,8 +1260,8 @@ export class AcpAgent {
           'Compacted while idle to keep the next wake small.',
           { beforeChars, background: true },
         );
-        if (shrank) {
-          session.lastContextTokens = 0;
+        if (compacted.shrank) {
+          await this.publishCompactedContext(session, sessionId, cx, beforeChars, compacted.afterChars, tokensBefore);
           return;
         }
 

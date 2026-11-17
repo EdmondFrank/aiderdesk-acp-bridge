@@ -7,6 +7,19 @@ describe('contextCharsOf', () => {
     expect(contextCharsOf([{ content: 'abc' }, { content: 'de' }, {}])).toBe(5);
   });
 
+  test('counts tool responses and arguments, which is most of a context', () => {
+    const messages = [
+      { content: 'go', reasoning: 'maybe' },
+      { content: 'null', response: 'x'.repeat(400), args: { path: '/a' } },
+    ];
+    // 'go' (2) + 'maybe' (5) + 'null' (4) + 400 characters of result + the arguments.
+    expect(contextCharsOf(messages)).toBe(2 + 5 + 4 + 400 + JSON.stringify({ path: '/a' }).length);
+  });
+
+  test('tolerates a message without a payload', () => {
+    expect(contextCharsOf([{ content: 'a' }, { content: undefined, response: undefined }])).toBe(1);
+  });
+
   test('returns zero for an empty context', () => {
     expect(contextCharsOf([])).toBe(0);
   });

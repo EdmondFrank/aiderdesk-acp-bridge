@@ -91,6 +91,29 @@ export function contextWindowFor(session: Parameters<typeof resolveContextModel>
 }
 
 /**
+ * Estimate the prompt tokens a context of `chars` characters costs this model.
+ *
+ * A compaction replaces the transcript without running a turn, so the figure
+ * that follows it cannot be measured. The last turn supplies the
+ * tokens-per-character ratio this model actually charged; the compacted
+ * transcript supplies the characters. `undefined` when either side of that
+ * ratio is unknown, so callers can fall back instead of inventing a number.
+ */
+export function estimateContextTokens(
+  chars: number | undefined,
+  promptTokens: number | undefined,
+  promptChars: number | undefined,
+): number | undefined {
+  if (chars === undefined || promptTokens === undefined || promptChars === undefined) {
+    return undefined;
+  }
+  if (promptChars <= 0 || promptTokens <= 0 || chars < 0) {
+    return undefined;
+  }
+  return Math.max(0, Math.round((chars * promptTokens) / promptChars));
+}
+
+/**
  * Prompt tokens of the last stored turn, or `undefined` when the conversation
  * holds no usage report yet.
  *

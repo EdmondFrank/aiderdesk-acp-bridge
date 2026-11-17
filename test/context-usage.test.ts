@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   contextWindowFor,
+  estimateContextTokens,
   lastContextTokensFrom,
   parseComposedModelId,
   resolveContextModel,
@@ -90,6 +91,28 @@ describe('contextWindowFor', () => {
 
   test('returns zero when no model can be resolved', () => {
     expect(contextWindowFor(session({ agentProfileId: 'bare' }))).toBe(0);
+  });
+});
+
+describe('estimateContextTokens', () => {
+  test('scales the characters at the ratio the last turn was billed at', () => {
+    // 10,100 tokens for 20,000 characters is ~0.505 tokens per character.
+    expect(estimateContextTokens(2_000, 10_100, 20_000)).toBe(1_010);
+  });
+
+  test('returns undefined when either side of the ratio is unknown', () => {
+    expect(estimateContextTokens(2_000, undefined, 20_000)).toBeUndefined();
+    expect(estimateContextTokens(2_000, 10_100, undefined)).toBeUndefined();
+    expect(estimateContextTokens(undefined, 10_100, 20_000)).toBeUndefined();
+  });
+
+  test('rejects a ratio it cannot divide by', () => {
+    expect(estimateContextTokens(2_000, 10_100, 0)).toBeUndefined();
+    expect(estimateContextTokens(2_000, 0, 20_000)).toBeUndefined();
+  });
+
+  test('reports an empty context as zero', () => {
+    expect(estimateContextTokens(0, 10_100, 20_000)).toBe(0);
   });
 });
 
