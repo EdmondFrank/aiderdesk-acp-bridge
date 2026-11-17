@@ -53,7 +53,7 @@ bun install
 # Run from source (pipe into an ACP client)
 bun run dev -- --port 23456
 
-# Or install the CLI
+# Or link the CLI onto PATH (registers the package and symlinks its bin into ~/.bun/bin)
 bun link
 aiderdesk-acp-bridge --port 23456
 
