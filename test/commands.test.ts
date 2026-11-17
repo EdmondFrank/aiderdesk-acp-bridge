@@ -76,6 +76,15 @@ describe('toAvailableCommands', () => {
     ]);
   });
 
+  test('advertises skills in the spelling that triggers them', () => {
+    const available = toAvailableCommands({ customCommands: [], extensionCommands: [] }, [
+      { name: 'pdf', description: 'Read PDFs', location: 'project', activated: false },
+      { name: 'brainstorming', description: 'Explore ideas', activated: true },
+    ]);
+    expect(available).toContainEqual({ name: 'skill:brainstorming', description: 'Explore ideas (active)' });
+    expect(available).toContainEqual({ name: 'skill:pdf', description: 'Read PDFs' });
+  });
+
   test('does not advertise built-in aliases', () => {
     const names = toAvailableCommands({ customCommands: [], extensionCommands: [] }).map((c) => c.name);
     expect(names).not.toContain('hand-off');

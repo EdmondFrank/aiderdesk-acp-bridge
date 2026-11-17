@@ -49,7 +49,7 @@ versions exist and must not be confused:
 ```sh
 bun install         # install dependencies
 bun run dev         # run from source (pipes into an ACP client)
-bun test            # bun:test suite — 243 tests across 13 files
+bun test            # bun:test suite — 279 tests across 14 files
 bun run typecheck   # bunx tsc --noEmit (strict)
 bun run build       # compile a single standalone binary to dist/
 ```
@@ -65,9 +65,10 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
 | `src/index.ts` | CLI entry: arg parsing (`-p/--port`, `--host`, `-v`, `-h`, `AIDER_DESK_PORT` env), health check against `/api/health`, wraps `process.stdout` in a web `WritableStream` (Bun's `stdout.stream()` lacks `getWriter`), wires ACP methods and notifications to an `AcpAgent` over NDJSON stdio (including `session/list`, `session/load`, `session/resume`, `session/delete`). |
 | `src/agent.ts` | `AcpAgent` class — the ACP lifecycle and session state (`Map<sessionId, AcpSession>`). Sessions map 1:1 to AiderDesk tasks: `newSession` eagerly creates the task (`add-open` + `tasks/new`) and uses the task id as the session id (falling back to a local id when creation fails). `listSessions`/`loadSession`/`resumeSession`/`deleteSession` implement ACP session management over the task API; `listSessions` returns tasks newest-created first (`sortTasksNewestFirst`, the same order `/tasks` renders and `/load #N` indexes into), and `loadSession`/`resumeSession` announce the task title (`session_info_update`) and adopt the task's own mode/profile/autonomy/model via `applyTaskSettings` instead of the project defaults, and `resumeSession` only calls `resume-task` when `shouldResumeTask` says the server left the task `IN_PROGRESS`/`INTERRUPTED` (`AIDER_DESK_ACP_RESUME_TASK` overrides) — an idle reconnect must not spend a model turn; `replayTaskMessages` streams a loaded conversation as session updates (tool calls go through the same `notifyToolCallStart`/`notifyToolCallEnd` helpers as the live relay, because a `tool_call_update` without its `tool_call` renders nameless). `prompt()` is the dispatcher: built-in command → direct REST; file-based custom command → local template expansion + SSE prompt flow; extension command → server-side `custom-commands` (best effort); anything else → regular `POST /api/run-prompt` SSE flow. `relaySse()` translates SSE events into ACP notifications. `setConfigOption` also handles the `model` config id (composed `provider/model` value) and persists it via `updateTaskModel` when a task exists, and persists `agent_profile`/`autonomy_mode` via `updateTaskFields` (the server ignores both on `run-prompt` once a task exists). `applyStandingPrompt` turns `_meta.systemPromptOverride` into a project rules file, `answerPendingQuestion` answers `ask-question` SSE events when `AIDER_DESK_ACP_AUTO_ANSWER` is set, and `replayMode` (`AIDER_DESK_ACP_REPLAY`) controls how much of a loaded task is replayed. |
 | `src/commands.ts` | Slash-command support: `fetchCommands` (`GET /api/project/commands`), command normalization/lookup, `BUILT_IN_COMMANDS` (`/new`, `/compact`, `/smart-compact`, `/handoff` + alias `/hand-off`, `/tasks`, `/load`), `parseCommandText`, argument substitution (`{{1}}`, `{{2}}`, `{{ARGUMENTS}}`), `!shell` line execution, template expansion. |
-| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `listTasksStrict`, `loadTaskStrict`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `updateTaskFields`, `answerQuestion`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers; the `…Strict` variants distinguish "request failed" from "empty/missing", which is what `session/load` needs. |
+| `src/http.ts` | REST + SSE plumbing: `fetchJSON` (with configurable `timeoutMs`), `requestSSEStream` (path-parameterized, reads `x-task-id` header), `callInterrupt`, `createTask`, `ensureProjectOpen`, `listTasks`, `loadTask`, `listTasksStrict`, `loadTaskStrict`, `resumeTask`, `deleteTask`, `runCustomCommand`, `updateTaskModel`, `updateTaskFields`, `answerQuestion`, `activateSkill`, `compactConversation`, `smartCompactConversation`, `handoffConversation`. All REST endpoints used by the bridge live here as named helpers; the `…Strict` variants distinguish "request failed" from "empty/missing", which is what `session/load` needs. |
 | `src/session-policy.ts` | Per-project session state that must outlive the process: `writeStandingPrompt`/`clearStandingPrompt` (the ACP standing prompt as `<project>/.aider-desk/rules/raft-standing-prompt.md`, which AiderDesk renders into the system prompt) and the session-id → task-id map (`rememberSessionTask`, `resolveSessionTask`, `forgetSessionTask`) persisted under `$AIDER_DESK_ACP_STATE_DIR` (default `~/.local/state/aiderdesk-acp`). |
-| `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project settings/provider models (`fetchAgentProfiles` keeps each profile's `provider`/`model`, `fetchProviderModels` keeps `maxInputTokens`, `fetchProjectSettings` returns the default profile + `mainModel`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
+| `src/skills.ts` | Skill support: `fetchSkills` (`GET /api/skills`, dropping `user-invocable: false` entries and sorting by name), `parseSkillCommand` (a byte-for-byte mirror of the server's `/skill:<name> [prompt]` pattern) and `SKILL_COMMAND_PREFIX`, the spelling skills are advertised in. `src/commands.ts` appends them to `available_commands_update` as `skill:<name>` (description suffixed `(active)` once the task carries the skill), and `AcpSession.skills` holds the list, re-read by `refreshSkills` whenever the session changes task. |
+| `src/modes.ts` | Agent profiles and chat modes: fetch profiles/custom modes/project settings/provider models (`fetchAgentProfiles` keeps each profile's `provider`/`model`, `fetchProviderModels` keeps `maxInputTokens`, `fetchProjectSettings` returns the default profile + `mainModel` + `disabledSkills`), `getAllModes`, `buildModeState`, `buildConfigOptions` (ACP `chat_mode`, `agent_profile`, `autonomy_mode` and `model` selects). |
 | `src/context-usage.ts` | Context-window resolution for `usage_update`: `resolveContextModel` (session selection → agent profile's model → project `mainModel`, ignoring models the server no longer lists), `contextWindowFor`, `parseComposedModelId`, `lastContextTokensFrom` (seeds `used` when a loaded conversation is replayed), `estimateContextTokens` (the figure a compaction leaves behind, which no turn measures). |
 | `src/sse.ts` | `parseSSEEvents` — async generator parsing an SSE `ReadableStream` into `{type, data}` events (multi-line data, chunk boundaries, CRLF, trailing event without blank line). |
 | `src/tools.ts` | SSE tool events ↔ ACP tool calls: `inferToolKind`, `parseToolArgs`, `formatToolInputAsText`, `formatToolTitle` (with `summarizeToolArgs` giving every unnamed tool a parameter-bearing title), `parseToolResponse`, `isToolFailed`, `buildToolCallContentArray` (diffs, terminal, text content), plus `contentBlocksToPrompt` and `generateSessionId`. |
@@ -93,6 +94,12 @@ AiderDesk server: they mock `globalThis.fetch` and the ACP context.
      create a task if needed, `POST /api/project/custom-commands`, best-effort,
      no streaming, always `end_turn`. Feedback goes to the client as an
      `agent_thought_chunk`.
+   - **Skill trigger** (`/skill:<name> [prompt]`) → `runSkillCommandPrompt`:
+     `POST /api/skills/activate`, report it as an `agent_thought_chunk`, mark the
+     skill active in the command list, and then run the remaining text through
+     the regular SSE flow (or `end_turn` for a bare trigger). An unknown name is
+     reported instead of sent; a session with no skill list passes the line
+     through, since the server parses the same trigger.
 3. Otherwise (regular prompt, or an unknown `/foo` passed through untouched) →
    `runPromptRequest` → `POST /api/run-prompt` SSE → `relaySse` translates events
    into ACP session updates until `stream-end`/`error`/abort.
@@ -159,7 +166,15 @@ Every dispatch path ends in a `stopReason`; the `finally` block clears
   stream carries no tokens/context event and the bridge is idle while it
   happens — so the header keeps the last turn's figure until the next prompt.
 - **Built-in commands cannot be shadowed** — they resolve before project
-  custom/extension commands.
+  custom/extension commands. Skill triggers resolve after the built-ins and
+  before custom commands, so a project command named `skill:<x>` cannot
+  shadow a skill.
+- **Skills are fetched once per session**, like commands, and re-read when the
+  session changes task (`/new`, `/load`, `/handoff`). Activation state is what
+  this process observed: activating through `POST /api/skills/activate` marks
+  the skill locally, and a skill the *model* activated mid-turn is only in the
+  next fetched list. `GET /api/skills` ignores the project's `disabledSkills`,
+  so `fetchProjectSettings` carries them and `createSession` filters.
 - **Custom command limitations**: `includeContext: false` and `skills` frontmatter
   are not surfaced by the REST API and are ignored; the expanded prompt always runs
   with the task's normal conversation context.

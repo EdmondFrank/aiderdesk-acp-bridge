@@ -62,6 +62,11 @@ function createMockRouter() {
       match: (url: string) => url.includes('/api/settings'),
       handler: () => new Response('{}', { status: 200 }),
     },
+    {
+      method: 'GET',
+      match: (url: string) => url.includes('/api/skills'),
+      handler: () => new Response('[]', { status: 200 }),
+    },
   ];
 
   const router = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -596,6 +601,190 @@ describe('AcpAgent', () => {
         options: [{ value: 'openai-compatible/Idol', name: 'Idol' }],
       },
     ]);
+  });
+
+  /** Skills a session advertises: one triggerable, one model-only, one disabled. */
+  function addSkillsRoute(
+    router: ReturnType<typeof createMockRouter>,
+    { pdfActivated = true }: { pdfActivated?: boolean } = {},
+  ) {
+    router.add('GET', '/api/project/settings', () =>
+      new Response(JSON.stringify({ disabledSkills: ['secret'] }), { status: 200 }),
+    );
+    router.add(
+      'GET',
+      '/api/skills',
+      () =>
+        new Response(
+          JSON.stringify([
+            { name: 'pdf', description: 'Read PDFs', location: 'project', activated: pdfActivated },
+            { name: 'agent-only', description: 'Model-only skill', userInvocable: false },
+            { name: 'secret', description: 'Disabled skill' },
+          ]),
+          { status: 200 },
+        ),
+    );
+  }
+
+  function availableCommandsOf(notifyCalls: Array<{ params: unknown }>): Array<{ name: string; description: string }> {
+    for (const call of notifyCalls) {
+      const update = (call.params as { update?: { sessionUpdate?: string; availableCommands?: unknown } })
+        .update;
+      if (update?.sessionUpdate === 'available_commands_update') {
+        return update.availableCommands as Array<{ name: string; description: string }>;
+      }
+    }
+    return [];
+  }
+
+  test('newSession advertises the skills a prompt may trigger', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    addSkillsRoute(router);
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const commands = availableCommandsOf(notifyCalls);
+    expect(commands).toContainEqual({ name: 'skill:pdf', description: 'Read PDFs (active)' });
+    // A skill the model alone may pick, and one the project switched off, are
+    // not offered to a client that can only trigger them from a prompt.
+    expect(commands.map((command) => command.name)).not.toContain('skill:agent-only');
+    expect(commands.map((command) => command.name)).not.toContain('skill:secret');
+  });
+
+  test('prompt activates a skill and then runs the rest as the prompt', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    addSkillsRoute(router, { pdfActivated: false });
+    let activatedBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/skills/activate', (call) => {
+      activatedBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    });
+    let promptBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      promptBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(sseBody([{ type: 'stream-end', data: {} }]), {
+        status: 200,
+        headers: { 'x-task-id': 'task-1' },
+      });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/skill:pdf extract the tables' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(activatedBody).toEqual({ projectDir: '/proj', taskId: 'task-1', skillName: 'pdf' });
+    expect(promptBody).toEqual(expect.objectContaining({ prompt: 'extract the tables', taskId: 'task-1' }));
+  });
+
+  test('prompt reports a bare skill trigger without spending a turn', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    addSkillsRoute(router);
+    router.add('POST', '/api/skills/activate', () =>
+      new Response(JSON.stringify({ success: true }), { status: 200 }),
+    );
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/skill:pdf' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+    const thought = notifyCalls
+      .map((call) => (call.params as { update: { sessionUpdate: string; content?: { text: string } } }).update)
+      .filter((update) => update.sessionUpdate === 'agent_thought_chunk')
+      .map((update) => update.content?.text);
+    expect(thought).toContain("Skill 'pdf' is already active.");
+  });
+
+  test('prompt reports an unknown skill instead of passing it on', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    addSkillsRoute(router);
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx, notifyCalls } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/skill:nope do something' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(router.callsMatching(/\/api\/skills\/activate/)).toHaveLength(0);
+    expect(router.callsMatching(/\/api\/run-prompt/)).toHaveLength(0);
+    const thought = notifyCalls
+      .map((call) => (call.params as { update: { sessionUpdate: string; content?: { text: string } } }).update)
+      .filter((update) => update.sessionUpdate === 'agent_thought_chunk')
+      .map((update) => update.content?.text);
+    expect(thought).toContain("Unknown skill 'nope'. Available skills: pdf.");
+  });
+
+  test('passes a skill line through untouched when the session has no skill list', async () => {
+    const router = createMockRouter();
+    router.add('GET', '/api/agent-profiles', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/custom-modes', () => new Response('[]', { status: 200 }));
+    router.add('GET', '/api/project/commands', () =>
+      new Response(JSON.stringify({ customCommands: [], extensionCommands: [] }), { status: 200 }),
+    );
+    let promptBody: Record<string, unknown> | undefined;
+    router.add('POST', '/api/run-prompt', (call) => {
+      promptBody = JSON.parse(String(call.init?.body)) as Record<string, unknown>;
+      return new Response(sseBody([{ type: 'stream-end', data: {} }]), {
+        status: 200,
+        headers: { 'x-task-id': 'task-1' },
+      });
+    });
+    globalThis.fetch = router.router as typeof fetch;
+
+    const agent = new AcpAgent('localhost', 24337);
+    const { cx } = mockContext();
+    const session = await agent.newSession({ cwd: '/proj', mcpServers: [] }, cx);
+
+    const result = await agent.prompt(
+      { sessionId: session.sessionId, prompt: [{ type: 'text', text: '/skill:pdf extract the tables' }] },
+      cx,
+    );
+
+    expect(result).toEqual({ stopReason: 'end_turn' });
+    expect(promptBody).toEqual(expect.objectContaining({ prompt: '/skill:pdf extract the tables' }));
   });
 
   test('prompt expands a custom command and streams it through run-prompt', async () => {

@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import * as acp from '@agentclientprotocol/sdk';
 
 import { fetchJSON } from './http';
+import { SKILL_COMMAND_PREFIX, type SkillInfo } from './skills';
 
 /**
  * Slash-command support for the ACP bridge.
@@ -219,19 +220,31 @@ export function commandHint(command: BridgeCommand): string | undefined {
  * Map project commands plus the built-in session-control commands to the ACP
  * `available_commands_update` payload. Aliases (e.g. `/hand-off`) are accepted
  * when invoked but only the canonical name is advertised.
+ *
+ * Skills are appended in the spelling that triggers them — `/skill:<name>`,
+ * the line the AiderDesk server parses itself — so a client's `/` completion
+ * offers them without knowing what a skill is. An activated skill is marked in
+ * its description, the only field ACP offers for that.
  */
-export function toAvailableCommands(data: CommandsData): acp.AvailableCommand[] {
+export function toAvailableCommands(
+  data: CommandsData,
+  skills: SkillInfo[] = [],
+): acp.AvailableCommand[] {
   const commands = [...data.customCommands, ...data.extensionCommands, ...BUILT_IN_COMMANDS];
-  return commands
-    .map((command) => {
+  return [
+    ...commands.map((command) => {
       const hint = commandHint(command);
       return {
         name: command.name,
         description: command.description,
         ...(hint ? { input: { hint } } : {}),
       };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+    }),
+    ...skills.map((skill) => ({
+      name: `${SKILL_COMMAND_PREFIX}${skill.name}`,
+      description: skill.activated ? `${skill.description} (active)` : skill.description,
+    })),
+  ].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**

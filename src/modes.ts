@@ -144,14 +144,17 @@ export type ProjectSettings = {
   agentProfileId?: string;
   /** Aider modes' main model as a composed `provider/model` id. */
   mainModel?: string;
+  /** Skills the project switched off; a client must never see them. */
+  disabledSkills: string[];
 };
 
 /**
  * Fetch the project's settings (`GET /api/project/settings`).
  *
- * Only the two fields the bridge needs are kept: the default agent profile
- * (which one a new session starts on) and `mainModel` (the model Aider modes
- * run with, used to size the context window). Returns `{}` on any failure so
+ * Only the fields the bridge needs are kept: the default agent profile (which
+ * one a new session starts on), `mainModel` (the model Aider modes run with,
+ * used to size the context window) and `disabledSkills` (the endpoint that
+ * lists skills does not apply them). Returns empty settings on any failure so
  * callers degrade to the previous behaviour.
  */
 export async function fetchProjectSettings(
@@ -166,8 +169,10 @@ export async function fetchProjectSettings(
       `/api/project/settings?projectDir=${encodeURIComponent(projectDir)}`,
       'GET',
     );
-    if (response.status !== 200) return {};
-    const settings = response.data as { agentProfileId?: unknown; mainModel?: unknown } | undefined;
+    if (response.status !== 200) return { disabledSkills: [] };
+    const settings = response.data as
+      | { agentProfileId?: unknown; mainModel?: unknown; disabledSkills?: unknown }
+      | undefined;
     return {
       ...(typeof settings?.agentProfileId === 'string' && settings.agentProfileId
         ? { agentProfileId: settings.agentProfileId }
@@ -175,9 +180,12 @@ export async function fetchProjectSettings(
       ...(typeof settings?.mainModel === 'string' && settings.mainModel
         ? { mainModel: settings.mainModel }
         : {}),
+      disabledSkills: Array.isArray(settings?.disabledSkills)
+        ? settings.disabledSkills.filter((name): name is string => typeof name === 'string')
+        : [],
     };
   } catch {
-    return {};
+    return { disabledSkills: [] };
   }
 }
 

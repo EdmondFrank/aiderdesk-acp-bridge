@@ -177,6 +177,16 @@ Commands are invoked by sending `/name arg1 arg2` as the prompt:
   template; the bridge creates a task if needed (`POST /api/project/tasks/new`)
   and asks the server to run the command (`POST /api/project/custom-commands`),
   best-effort and without streaming.
+- **Skills** are advertised alongside the commands, as `/skill:<name>`, from
+  `GET /api/skills` — the same `/skill:<name> [prompt]` line AiderDesk parses
+  itself, so a client's `/` completion offers them without knowing what a
+  skill is. Skills marked `user-invocable: false` and the project's
+  `disabledSkills` are left out. The bridge activates the skill itself
+  (`POST /api/skills/activate`) before running whatever follows the trigger as
+  a prompt, so a bare `/skill:<name>` still reports "activated" instead of the
+  silent no-turn the server answers with; an activated skill is marked
+  `(active)` in its description. A session without a skill list (the fetch
+  failed) passes the line through untouched.
 - Unknown `/foo` text is passed through unchanged as a regular prompt.
 
 ### Known limitations
@@ -188,13 +198,14 @@ Commands are invoked by sending `/name arg1 arg2` as the prompt:
   REST API offers no event stream for `custom-commands`); custom commands
   stream fully.
 - Command definitions are fetched once per session; file changes while a
-  session is open require a new session to take effect.
+  session is open require a new session to take effect. Skills are re-read
+  whenever the session changes task (`/new`, `/load`, `/handoff`).
 
 ## Development
 
 ```sh
 bun run typecheck   # bunx tsc --noEmit
-bun test            # bun:test suite (SSE parser, tool mapping, agent flow)
+bun test            # bun:test suite (SSE parser, tool mapping, skills, agent flow)
 bun run build       # compile a standalone binary to dist/
 ```
 

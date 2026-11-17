@@ -518,6 +518,36 @@ export async function answerQuestion(
 }
 
 /**
+ * Activate a skill on a task (`POST /api/skills/activate`).
+ *
+ * Returns whether the server activated it, so the caller can report the
+ * outcome; an already-active skill counts as activated. Never throws.
+ */
+export async function activateSkill(
+  host: string,
+  port: number,
+  projectDir: string,
+  taskId: string,
+  skillName: string,
+): Promise<boolean> {
+  try {
+    const response = await fetchJSON(
+      host,
+      port,
+      '/api/skills/activate',
+      'POST',
+      JSON.stringify({ projectDir, taskId, skillName }),
+    );
+    if (response.status !== 200) {
+      return false;
+    }
+    return (response.data as { success?: unknown } | undefined)?.success === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Update arbitrary task fields (`POST /api/project/tasks` accepts a partial
  * `TaskData`). Used to persist session config options that `run-prompt`
  * ignores once a task id exists. Best-effort: failures are swallowed.

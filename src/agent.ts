@@ -24,6 +24,7 @@ import {
   type ModeOption,
 } from './constants';
 import {
+  activateSkill,
   answerQuestion,
   callInterrupt,
   compactConversation,
@@ -77,6 +78,7 @@ import {
   resolveSessionTask,
   writeStandingPrompt,
 } from './session-policy';
+import { fetchSkills, parseSkillCommand, type ParsedSkillCommand, type SkillInfo } from './skills';
 import { parseSSEEvents } from './sse';
 import {
   buildToolCallContentArray,
@@ -166,6 +168,13 @@ export type AcpSession = {
   providers: ProviderInfo[];
   /** Starred model ids, advertised first like AiderDesk's own picker. */
   preferredModelIds: string[];
+  /**
+   * Skills this client may trigger, as `/skill:<name>`. Refreshed when the
+   * session changes task, so activation state follows the conversation.
+   */
+  skills: SkillInfo[];
+  /** Skills the project switched off, kept to filter every refresh. */
+  disabledSkills: string[];
   model?: string;
   /** Project's Aider `mainModel`, so a fresh session can size its context window. */
   mainModel?: string;
@@ -424,21 +433,34 @@ export class AcpAgent {
   /**
    * Build a fresh AcpSession for the given working directory, fetching agent
    * profiles, custom modes, the project default profile, provider models,
-   * providers, preferred models and slash commands. `taskId` is the server task
-   * the session is bound to (its ACP session id).
+   * providers, preferred models, skills and slash commands. `taskId` is the
+   * server task the session is bound to (its ACP session id).
    */
   private async createSession(cwd: string, taskId: string | undefined): Promise<AcpSession> {
-    const [agentProfiles, customModes, projectSettings, commands, models, providers, preferredModelIds] =
-      await Promise.all([
-        fetchAgentProfiles(this.host, this.port),
-        fetchCustomModes(this.host, this.port, cwd),
-        fetchProjectSettings(this.host, this.port, cwd),
-        fetchCommands(this.host, this.port, cwd),
-        fetchProviderModels(this.host, this.port),
-        fetchProviders(this.host, this.port),
-        fetchPreferredModels(this.host, this.port),
-      ]);
+    const [
+      agentProfiles,
+      customModes,
+      projectSettings,
+      commands,
+      models,
+      providers,
+      preferredModelIds,
+      fetchedSkills,
+    ] = await Promise.all([
+      fetchAgentProfiles(this.host, this.port),
+      fetchCustomModes(this.host, this.port, cwd),
+      fetchProjectSettings(this.host, this.port, cwd),
+      fetchCommands(this.host, this.port, cwd),
+      fetchProviderModels(this.host, this.port),
+      fetchProviders(this.host, this.port),
+      fetchPreferredModels(this.host, this.port),
+      fetchSkills(this.host, this.port, cwd, taskId),
+    ]);
     const allModes = getAllModes(customModes);
+    // `GET /api/skills` lists every loaded skill, including the ones the
+    // project switched off; only the enabled ones may reach the client.
+    const disabledSkills = new Set(projectSettings.disabledSkills);
+    const skills = fetchedSkills.filter((skill) => !disabledSkills.has(skill.name));
     const defaultProfileId = resolveDefaultProfileId(
       agentProfiles,
       projectSettings.agentProfileId,
@@ -456,6 +478,8 @@ export class AcpAgent {
       models,
       providers,
       preferredModelIds,
+      skills,
+      disabledSkills: [...disabledSkills],
       ...(projectSettings.mainModel ? { mainModel: projectSettings.mainModel } : {}),
       commands,
       usage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
@@ -463,7 +487,7 @@ export class AcpAgent {
   }
 
   /**
-   * Advertise the session's slash commands to the client.
+   * Advertise the session's slash commands and skills to the client.
    *
    * Every path that can introduce a session calls this — `session/new`,
    * `session/load` and `session/resume` — because clients restore persisted
@@ -475,7 +499,7 @@ export class AcpAgent {
    * would be dropped.
    */
   private advertiseCommands(session: AcpSession, sessionId: string, cx: acp.AgentContext): void {
-    const availableCommands = toAvailableCommands(session.commands);
+    const availableCommands = toAvailableCommands(session.commands, session.skills);
     if (availableCommands.length === 0) {
       return;
     }
@@ -772,6 +796,23 @@ export class AcpAgent {
         }
       }
 
+      // `/skill:<name> [prompt]` — AiderDesk's own skill trigger. Handled
+      // before the project's commands so a skill is never shadowed; a session
+      // without a skill list passes the line through (see
+      // `runSkillCommandPrompt`).
+      const skillCommand = parseSkillCommand(promptText);
+      if (skillCommand) {
+        return await this.runSkillCommandPrompt(
+          session,
+          params.sessionId,
+          promptText,
+          skillCommand,
+          images,
+          abortController,
+          cx,
+        );
+      }
+
       const command = parsedCommand ? findCommand(session.commands, parsedCommand.name) : undefined;
 
       if (parsedCommand && command?.template) {
@@ -867,6 +908,92 @@ export class AcpAgent {
   }
 
   /**
+   * Re-read the session's skills, so activation state matches the task the
+   * session is bound to now. Best-effort: a failed fetch keeps the old list.
+   */
+  private async refreshSkills(session: AcpSession): Promise<void> {
+    if (!session.taskId) {
+      return;
+    }
+    const disabled = new Set(session.disabledSkills);
+    const skills = await fetchSkills(this.host, this.port, session.cwd, session.taskId);
+    session.skills = skills.filter((skill) => !disabled.has(skill.name));
+  }
+
+  /**
+   * Trigger a skill: `/skill:<name> [prompt]`.
+   *
+   * The AiderDesk server parses the same line inside `runPrompt`, but it
+   * answers a bare `/skill:<name>` with no turn at all. Activating through
+   * REST first gives the client feedback on either shape and lets the command
+   * list mark the skill active; whatever follows the trigger then runs as an
+   * ordinary prompt.
+   */
+  private async runSkillCommandPrompt(
+    session: AcpSession,
+    sessionId: string,
+    promptText: string,
+    command: ParsedSkillCommand,
+    images: string[],
+    abortController: AbortController,
+    cx: acp.AgentContext,
+  ): Promise<acp.PromptResponse> {
+    const skill = session.skills.find((candidate) => candidate.name === command.skillName);
+
+    if (!skill) {
+      if (session.skills.length === 0) {
+        // The skill list is unknown (the fetch failed, or the session predates
+        // it), so the line goes through untouched: the server parses it too.
+        return this.runPromptRequest(session, sessionId, promptText, images, abortController, cx);
+      }
+      const available = session.skills.map((candidate) => candidate.name).join(', ');
+      await notifyThought(
+        cx,
+        sessionId,
+        `Unknown skill '${command.skillName}'. Available skills: ${available}.`,
+      );
+      return { stopReason: 'end_turn' };
+    }
+
+    // An already-active skill is not activated again (the server skips it),
+    // so its state is what the report below is based on.
+    const alreadyActive = skill.activated;
+    const activated =
+      alreadyActive ||
+      (session.taskId
+        ? await activateSkill(this.host, this.port, session.cwd, session.taskId, command.skillName)
+        : false);
+    if (!activated) {
+      await notifyThought(
+        cx,
+        sessionId,
+        `Could not activate skill '${command.skillName}'. It may have been disabled or removed since the session started.`,
+      );
+      return { stopReason: 'end_turn' };
+    }
+
+    if (!alreadyActive) {
+      session.skills = session.skills.map((candidate) =>
+        candidate.name === command.skillName ? { ...candidate, activated: true } : candidate,
+      );
+      this.advertiseCommands(session, sessionId, cx);
+      await notifyThought(
+        cx,
+        sessionId,
+        `Activated skill '${command.skillName}'${skill.location ? ` (${skill.location})` : ''}.`,
+      );
+    } else {
+      await notifyThought(cx, sessionId, `Skill '${command.skillName}' is already active.`);
+    }
+
+    if (!command.prompt && images.length === 0) {
+      return { stopReason: 'end_turn' };
+    }
+
+    return this.runPromptRequest(session, sessionId, command.prompt, images, abortController, cx);
+  }
+
+  /**
    * Expand a file-based custom command locally and stream it through the
    * regular run-prompt flow. Mirrors AiderDesk's server-side command
    * processing (argument substitution, `!shell` lines, required-argument
@@ -957,6 +1084,9 @@ export class AcpAgent {
           session.lastContextTokens = 0;
           session.idleCompactUseless = false;
           await rememberSessionTask(sessionId, taskId, session.cwd);
+          // A new task starts with an empty context, so no skill is active.
+          await this.refreshSkills(session);
+          this.advertiseCommands(session, sessionId, cx);
           await this.publishContextUsage(session, sessionId, cx, { used: 0 }).catch(() => {
             // best-effort: the client may not render usage updates
           });
@@ -994,6 +1124,9 @@ export class AcpAgent {
           session.lastContextTokens = 0;
           session.idleCompactUseless = false;
           await rememberSessionTask(sessionId, task.id, session.cwd);
+          // The loaded task carries its own context, hence its own skills.
+          await this.refreshSkills(session);
+          this.advertiseCommands(session, sessionId, cx);
           await notifyThought(
             cx,
             sessionId,
@@ -1063,6 +1196,9 @@ export class AcpAgent {
             session.lastContextTokens = 0;
             session.idleCompactUseless = false;
             await rememberSessionTask(sessionId, newTaskId, session.cwd);
+            // The handed-off task starts fresh, so no skill is active.
+            await this.refreshSkills(session);
+            this.advertiseCommands(session, sessionId, cx);
             await this.publishContextUsage(session, sessionId, cx, { used: 0 }).catch(() => {
               // best-effort: the client may not render usage updates
             });
